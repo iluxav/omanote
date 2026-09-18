@@ -31,8 +31,10 @@ const PULL_EVERY: Duration = Duration::from_secs(60);
 const SCRIPT: &str = r#"
 cd "$1" || exit 1
 status="$2"; msg="$3"; log="$status.log"
-finish() { printf '%s\n' "$1" > "$status.tmp" && mv -f "$status.tmp" "$status"; exit 0; }
 lock=.git/omanote-sync.lock
+# The status is the very last thing written: whoever reads it can rely on the
+# lock being free and git being done.
+finish() { rmdir "$lock" 2>/dev/null; printf '%s\n' "$1" > "$status.tmp" && mv -f "$status.tmp" "$status"; exit 0; }
 tries=0
 until mkdir "$lock" 2>/dev/null; do
     tries=$((tries + 1))
@@ -308,6 +310,8 @@ mod tests {
         assert_eq!(wait(&mut sync), "Synced to GitHub");
         assert_eq!(git(&here, &["log", "-1", "--format=%s"]), "omanote: update idea.md");
         assert_eq!(git(&root.join("hub.git"), &["log", "-1", "--format=%s", "main"]), "omanote: update idea.md");
+        // The status arrives a hair before the process is gone.
+        settle(&mut sync, &here);
         assert_eq!(sync.state(&here.join("idea.md"), &vault(&here)), Some("github"));
 
         // The other machine opens a note: the pull brings the new one in.
