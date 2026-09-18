@@ -1,4 +1,4 @@
-<img src="assets/icon.svg" width="96" align="right" alt="omanote icon">
+ <img src="assets/icon.svg" width="96" align="right" alt="omanote icon">
 
 # omanote
 
@@ -106,6 +106,8 @@ Notes in a `--vlgh` vault are kept in step with the repo, in the background:
 - Opening a note pulls. You see the note straight away; if the pull changed it, it reloads.
 - Saving commits and pushes, once the note has been quiet for 30 seconds, and when you switch notes or quit. Quitting does not wait for the network: the push finishes on its own.
 - The status line shows `⇅ github`, `⇅ to sync` or `⇅ syncing…`.
+
+To sync by hand, and see what happened, run `omanote --sync`: it goes through every GitHub vault, commits anything uncommitted, pulls, then pushes, and exits non-zero if a vault failed.
 
 If the same note was changed in two places, your version is committed locally, nothing is overwritten, and omanote tells you to resolve it with git. Offline, commits wait and go out the next time you open or save a note in that vault. Set `OMANOTE_SYNC=off` to turn all of this off. Folders added with `--vl` are never committed to, even if they are git repositories.
 

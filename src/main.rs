@@ -38,6 +38,8 @@ const DEMO: &str = include_str!("../demo.md");
 const AUTOSAVE_IDLE: Duration = Duration::from_millis(1500);
 const TOAST: Duration = Duration::from_secs(2);
 const DOUBLE_CLICK: Duration = Duration::from_millis(350);
+/// How long `omanote <name>` waits for GitHub before giving up and starting a new note.
+const PULL_PATIENCE: Duration = Duration::from_secs(8);
 /// Pasted images wider than this are scaled down before they are embedded.
 const PASTE_MAX_WIDTH: u32 = 2000;
 
@@ -482,6 +484,7 @@ Vaults (where Ctrl+P looks; new notes go in ~/.omanote/docs):
   omanote --vlgh <owner/repo> clone a GitHub repo into ~/.omanote/vaults and add it
   omanote --vlrm <name>       forget a vault (folder, owner/repo or name); files are kept
   omanote --vls               list vaults
+  omanote --sync              sync every GitHub vault now: pull, then push
 
   --keys                      show every key event (for diagnosing a terminal)
   -h, --help                  this text
@@ -523,6 +526,10 @@ fn cli(args: &[String]) -> Result<(Target, bool, bool), String> {
             "--vlgh" => vaults::add_github(&home, &value("a GitHub repo, like owner/repo")?)?,
             "--vlrm" => vaults::remove(&home, &value("the vault to remove")?)?,
             "--vls" => vaults::list(&home),
+            "--sync" => {
+                let ok = sync::sync_all(&home, &vaults::all(&home));
+                std::process::exit(if ok { 0 } else { 1 });
+            }
             "-h" | "--help" => HELP.to_string(),
             "--keys" => {
                 keys = true;
@@ -557,6 +564,7 @@ fn main() -> std::io::Result<()> {
     // A name is looked up before the screen is taken over: one match is simply
     // the file to open; several leave the list up; none means a new note.
     let here = std::env::current_dir().ok();
+    let mut early_sync = sync::Sync::new(vaults::home());
     let mut picker = None;
     let mut wanted = None;
     let mut greeting = None;
@@ -564,8 +572,22 @@ fn main() -> std::io::Result<()> {
         Target::Untitled => None,
         Target::File(path) => Some(path),
         Target::Find(name) => {
-            let mut found = Picker::open_with(&vaults::all(&vaults::home()), here.as_deref());
-            found.push(&name);
+            let all = vaults::all(&vaults::home());
+            let look = |all: &[vaults::Vault]| {
+                let mut found = Picker::open_with(all, here.as_deref());
+                found.push(&name);
+                found
+            };
+            let mut found = look(&all);
+            // Not here — but it may have been made on GitHub or another machine.
+            // This is the one time waiting for a pull beats starting a new note.
+            if found.resolve() == Resolution::Nothing && early_sync.has_github(&all) {
+                eprintln!("“{name}” is not here yet — checking GitHub…");
+                if !early_sync.pull_now(&all, PULL_PATIENCE) {
+                    eprintln!("GitHub is slow to answer; carrying on (the pull continues in the background).");
+                }
+                found = look(&all);
+            }
             match found.resolve() {
                 Resolution::Open(path) => Some(path),
                 Resolution::Choose => {
@@ -606,7 +628,7 @@ fn main() -> std::io::Result<()> {
         picker,
         save_as: None,
         wanted,
-        sync: sync::Sync::new(vaults::home()),
+        sync: early_sync,
         seen_saves: 0,
         toast: None,
         last_click: None,
@@ -615,9 +637,9 @@ fn main() -> std::io::Result<()> {
         key_log,
         quit: false,
     };
-    if let Some(path) = &path {
-        app.sync.opened(path, &vaults::all(&vaults::home()));
-    }
+    // Freshen every GitHub vault as we start, in the background, so a note made
+    // elsewhere is here by the time it is looked for.
+    app.sync.pull_all(&vaults::all(&vaults::home()));
     app.ed = app.editor(&text, path);
     if let Some(msg) = greeting {
         app.say(msg);
