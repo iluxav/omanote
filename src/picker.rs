@@ -7,6 +7,9 @@ use crate::vaults::{Vault, tilde};
 
 const MAX_NOTES: usize = 10_000;
 const MAX_DEPTH: usize = 8;
+const VAULT_TYPES: [&str; 2] = ["md", "markdown"];
+/// The current folder is not a vault, so plain text files there count as notes too.
+const HERE_TYPES: [&str; 3] = ["md", "markdown", "txt"];
 
 pub struct Note {
     pub path: PathBuf,
@@ -37,7 +40,21 @@ pub struct Picker {
     hits: Vec<Hit>,
 }
 
-fn walk(dir: &Path, root: &Path, prefix: &str, depth: usize, out: &mut Vec<Note>) {
+/// What `omanote <words>` on the command line should do.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Resolution {
+    Open(PathBuf),
+    /// Several candidates: show the list.
+    Choose,
+    Nothing,
+}
+
+/// Names compare without case, and with `-`/`_` standing in for spaces.
+fn loose(text: &str) -> String {
+    text.to_lowercase().replace(['-', '_'], " ").split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn walk(dir: &Path, root: &Path, prefix: &str, types: &[&str], depth: usize, max_depth: usize, out: &mut Vec<Note>) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
         if out.len() >= MAX_NOTES {
@@ -49,10 +66,10 @@ fn walk(dir: &Path, root: &Path, prefix: &str, depth: usize, out: &mut Vec<Note>
             continue;
         }
         if kind.is_dir() {
-            if depth < MAX_DEPTH {
-                walk(&path, root, prefix, depth + 1, out);
+            if depth < max_depth {
+                walk(&path, root, prefix, types, depth + 1, max_depth, out);
             }
-        } else if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("markdown")) {
+        } else if path.extension().is_some_and(|e| types.iter().any(|t| e.eq_ignore_ascii_case(t))) {
             let rel = path.strip_prefix(root).unwrap_or(&path).with_extension("");
             let name: Vec<char> = format!("{prefix}{}", rel.to_string_lossy()).chars().collect();
             let lower = name.iter().flat_map(|c| c.to_lowercase()).collect();
@@ -64,10 +81,21 @@ fn walk(dir: &Path, root: &Path, prefix: &str, depth: usize, out: &mut Vec<Note>
 
 impl Picker {
     pub fn open(vaults: &[Vault]) -> Self {
+        Self::open_with(vaults, None)
+    }
+
+    /// Every vault, plus the notes lying directly in `here` (the folder omanote
+    /// was started from), shown as `./name`. Only that folder itself: it may be
+    /// a home directory, which is no place to go crawling.
+    pub fn open_with(vaults: &[Vault], here: Option<&Path>) -> Self {
         let mut notes = Vec::new();
         for (i, vault) in vaults.iter().enumerate() {
             let prefix = if i == 0 { String::new() } else { format!("{}/", vault.name()) };
-            walk(&vault.path, &vault.path, &prefix, 0, &mut notes);
+            walk(&vault.path, &vault.path, &prefix, &VAULT_TYPES, 0, MAX_DEPTH, &mut notes);
+        }
+        // Inside a vault the folder's notes are listed already.
+        if let Some(here) = here.filter(|h| !vaults.iter().any(|v| h.starts_with(&v.path))) {
+            walk(here, here, "./", &HERE_TYPES, 0, 0, &mut notes);
         }
         notes.sort_by(|a, b| b.modified.cmp(&a.modified).then_with(|| a.name.cmp(&b.name)));
         let roots = vaults.iter().map(|v| v.path.clone()).collect();
@@ -102,6 +130,25 @@ impl Picker {
         scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
         self.hits = scored.into_iter().map(|(_, hit)| hit).collect();
         self.selected = 0;
+    }
+
+    /// Decide what a query typed on the command line means. One clear answer
+    /// opens; an exact name beats longer names that contain it (`welcome` vs
+    /// `welcome-back`).
+    pub fn resolve(&self) -> Resolution {
+        let query = loose(&self.query);
+        if query.is_empty() {
+            return Resolution::Nothing;
+        }
+        let stem = |n: &Note| loose(&n.path.file_stem().unwrap_or_default().to_string_lossy());
+        let exact: Vec<&Note> = self.notes.iter().filter(|n| stem(n) == query).collect();
+        let containing: Vec<&Note> = self.notes.iter().filter(|n| stem(n).contains(&query)).collect();
+        match (&exact[..], &containing[..], &self.hits[..]) {
+            ([one], _, _) | ([], [one], _) => Resolution::Open(one.path.clone()),
+            ([], [], [one]) => Resolution::Open(self.notes[one.note].path.clone()),
+            ([], [], []) => Resolution::Nothing,
+            _ => Resolution::Choose,
+        }
     }
 
     /// Offer to create the note when nothing is named exactly what was typed.
@@ -345,6 +392,41 @@ mod tests {
         p.push("fresh idea");
         assert_eq!(p.chosen(), Some(first.join("fresh idea.md")));
         let _ = std::fs::remove_dir_all(first.parent().unwrap());
+    }
+
+    fn resolve(p: &mut Picker, query: &str) -> Resolution {
+        p.clear();
+        p.push(query);
+        p.resolve()
+    }
+
+    #[test]
+    fn command_line_queries_open_pick_or_start_fresh() {
+        let root = temp_vault(&["docs/welcome.md", "docs/welcome-back.md", "docs/My Ideas.md", "docs/work/todo.md", "here/README.md", "here/notes.txt", "here/photo.png", "here/sub/deep.md"]);
+        let vaults = [Vault { path: root.join("docs"), github: None }];
+        let mut p = Picker::open_with(&vaults, Some(&root.join("here")));
+        assert_eq!(p.total(), 6, "the vault, plus README.md and notes.txt from the current folder only");
+
+        // Case does not matter, and neither does typing the extension.
+        assert_eq!(resolve(&mut p, "readme"), Resolution::Open(root.join("here/README.md")));
+        assert_eq!(resolve(&mut p, "README"), Resolution::Open(root.join("here/README.md")));
+        assert_eq!(resolve(&mut p, "NOTES"), Resolution::Open(root.join("here/notes.txt")));
+        // An exact name wins over names that merely contain it…
+        assert_eq!(resolve(&mut p, "welcome"), Resolution::Open(root.join("docs/welcome.md")));
+        assert_eq!(resolve(&mut p, "Welcome-Back"), Resolution::Open(root.join("docs/welcome-back.md")));
+        // …a partial name with several candidates asks…
+        assert_eq!(resolve(&mut p, "welc"), Resolution::Choose);
+        assert_eq!(p.len(), 3, "two notes and the create row, ready to Tab through");
+        // …and a partial or fuzzy name with one candidate opens.
+        assert_eq!(resolve(&mut p, "idea"), Resolution::Open(root.join("docs/My Ideas.md")));
+        assert_eq!(resolve(&mut p, "my ideas"), Resolution::Open(root.join("docs/My Ideas.md")));
+        assert_eq!(resolve(&mut p, "tdo"), Resolution::Open(root.join("docs/work/todo.md")));
+        assert_eq!(resolve(&mut p, "zzz"), Resolution::Nothing);
+        assert_eq!(resolve(&mut p, "  "), Resolution::Nothing);
+
+        // Started from inside a vault, its notes are not listed twice.
+        assert_eq!(Picker::open_with(&vaults, Some(&root.join("docs/work"))).total(), 4);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

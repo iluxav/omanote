@@ -6,6 +6,7 @@ mod layout;
 mod markdown;
 mod picker;
 mod saveas;
+mod sync;
 mod table;
 mod ui;
 mod vaults;
@@ -30,7 +31,7 @@ use ratatui::crossterm::terminal::{
 
 use editor::{Editor, Pos};
 use images::Images;
-use picker::Picker;
+use picker::{Picker, Resolution};
 use saveas::{After, SaveAs};
 
 const DEMO: &str = include_str!("../demo.md");
@@ -44,6 +45,11 @@ struct App {
     ed: Editor,
     picker: Option<Picker>,
     save_as: Option<SaveAs>,
+    sync: sync::Sync,
+    /// What was asked for on the command line when nothing matched: a name for the new note.
+    wanted: Option<String>,
+    /// `ed.save_count` as of the last time the sync was told about saves.
+    seen_saves: u64,
     toast: Option<(String, Instant)>,
     last_click: Option<(Instant, Pos)>,
     enhanced_keys: bool,
@@ -66,6 +72,42 @@ impl App {
         }
     }
 
+    /// Tell the sync about saves it has not heard of yet.
+    fn note_saves(&mut self) {
+        if self.ed.save_count != self.seen_saves {
+            self.seen_saves = self.ed.save_count;
+            if let Some(path) = &self.ed.path {
+                self.sync.saved(path, &vaults::all(&vaults::home()));
+            }
+        }
+    }
+
+    /// Runs a few times a second: background sync, and noticing that the open
+    /// note changed on disk (a pull, another program).
+    fn tick(&mut self) {
+        self.note_saves();
+        if let Some(msg) = self.sync.tick() {
+            self.say(msg);
+        }
+        let Some(path) = self.ed.path.clone() else { return };
+        let on_disk = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        if on_disk.is_none() || on_disk == self.ed.disk_mtime {
+            return;
+        }
+        if self.ed.dirty {
+            self.ed.disk_mtime = on_disk;
+            return self.say("This note changed on disk while you were typing — keeping your version");
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else { return };
+        let (cursor, top, top_skip) = (self.ed.cursor, self.ed.top, self.ed.top_skip);
+        self.ed = self.editor(&text, Some(path));
+        self.seen_saves = 0;
+        let row = cursor.row.min(self.ed.lines.len() - 1);
+        self.ed.move_to(Pos { row, col: cursor.col.min(self.ed.lines[row].len()) }, false);
+        (self.ed.top, self.ed.top_skip) = (top.min(self.ed.lines.len() - 1), top_skip);
+        self.say("Note updated from disk");
+    }
+
     /// A note without a file that has something in it worth keeping.
     fn unsaved_draft(&self) -> bool {
         self.ed.path.is_none() && self.ed.dirty && self.ed.lines.iter().any(|l| l.iter().any(|c| !c.is_whitespace()))
@@ -73,13 +115,14 @@ impl App {
 
     fn ask_where(&mut self, after: After) {
         self.picker = None;
-        self.save_as = Some(SaveAs::new(&self.ed.lines, vaults::all(&vaults::home()), after));
+        let here = std::env::current_dir().ok();
+        self.save_as = Some(SaveAs::new(&self.ed.lines, vaults::all(&vaults::home()), here, self.wanted.as_deref(), after));
     }
 
     fn carry_on(&mut self, after: After) {
         match after {
             After::Stay => {}
-            After::Quit => self.quit = true,
+            After::Quit => self.quit(),
             After::Open(path) => self.open(path),
         }
     }
@@ -160,7 +203,12 @@ impl App {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(e) => return self.say(format!("Could not open {}: {e}", path.display())),
         };
+        // Send what the last note left behind, and freshen the new one's vault.
+        self.note_saves();
+        self.sync.flush();
+        self.sync.opened(&path, &vaults::all(&vaults::home()));
         self.ed = self.editor(&text, Some(path));
+        self.seen_saves = 0;
     }
 
     fn editor(&self, text: &str, path: Option<PathBuf>) -> Editor {
@@ -208,6 +256,9 @@ impl App {
         if self.ed.dirty && self.ed.path.is_some() {
             self.save();
         }
+        // Detached: the push carries on after we are gone.
+        self.note_saves();
+        self.sync.flush();
         self.quit = true;
     }
 
@@ -234,7 +285,11 @@ impl App {
         match key.code {
             KeyCode::Char(c) if ctrl => match c.to_ascii_lowercase() {
                 'q' => self.quit(),
-                'p' => self.picker = Some(Picker::open(&vaults::all(&vaults::home()))),
+                'p' => {
+                    let all = vaults::all(&vaults::home());
+                    self.sync.pull_all(&all);
+                    self.picker = Some(Picker::open_with(&all, std::env::current_dir().ok().as_deref()));
+                }
                 's' => self.save(),
                 'z' if shift => self.redo(),
                 'z' => {
@@ -392,11 +447,33 @@ fn restore_terminal(enhanced_keys: bool) {
     let _ = disable_raw_mode();
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn words_on_the_command_line_are_a_name_unless_they_are_a_path() {
+        let t = |words: &[&str]| target(&words.iter().map(|w| w.to_string()).collect::<Vec<_>>());
+        assert_eq!(t(&[]), Target::Untitled);
+        assert_eq!(t(&["welc"]), Target::Find("welc".into()));
+        assert_eq!(t(&["readme"]), Target::Find("readme".into()));
+        assert_eq!(t(&["my", "ideas"]), Target::Find("my ideas".into()));
+        for file in ["notes/todo", "./draft", "~/test.md", "new-note.md", "LOG.TXT", "../x"] {
+            assert_eq!(t(&[file]), Target::File(file.into()), "{file}");
+        }
+        // A real file wins even without an extension (run from the project root).
+        assert_eq!(t(&["Makefile"]), Target::File("Makefile".into()));
+    }
+}
+
 const HELP: &str = "\
 omanote — a small markdown note editor
 
   omanote                     start a new note; Ctrl+S asks where to keep it
-  omanote <file.md>           open (or start) a note
+  omanote <name>              find a note by name in this folder and every vault:
+                              one match opens, several are listed (Tab, Enter),
+                              none starts a new note. Case and .md do not matter.
+  omanote <path/to/file.md>   open (or start) that file
   omanote --demo              a note that shows off what the editor renders
   Ctrl+P inside the editor    fuzzy-find a note in any vault
 
@@ -410,10 +487,34 @@ Vaults (where Ctrl+P looks; new notes go in ~/.omanote/docs):
   -h, --help                  this text
 ";
 
+/// What the non-flag words on the command line ask for.
+#[derive(Debug, PartialEq, Eq)]
+enum Target {
+    Untitled,
+    File(PathBuf),
+    /// A name to look for in the current folder and the vaults.
+    Find(String),
+}
+
+/// One word that exists as a file, or is plainly a path, is a file. Anything
+/// else is a name to search for: `omanote my ideas`, `omanote readme`.
+fn target(words: &[String]) -> Target {
+    match words {
+        [] => Target::Untitled,
+        [one] => {
+            let path = PathBuf::from(one);
+            let lower = one.to_lowercase();
+            let pathlike = one.contains('/') || one.starts_with(['.', '~']) || [".md", ".markdown", ".txt"].iter().any(|e| lower.ends_with(e));
+            if pathlike || path.is_file() { Target::File(path) } else { Target::Find(one.clone()) }
+        }
+        many => Target::Find(many.join(" ")),
+    }
+}
+
 /// Handle the flags that do their job and exit. Returns what is left: the note to open.
-fn cli(args: &[String]) -> Result<(Option<PathBuf>, bool, bool), String> {
+fn cli(args: &[String]) -> Result<(Target, bool, bool), String> {
     let home = vaults::home();
-    let (mut path, mut keys, mut demo) = (None, false, false);
+    let (mut words, mut keys, mut demo) = (Vec::new(), false, false);
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         let mut value = |what: &str| it.next().cloned().ok_or(format!("{arg} needs {what}"));
@@ -432,26 +533,52 @@ fn cli(args: &[String]) -> Result<(Option<PathBuf>, bool, bool), String> {
                 continue;
             }
             flag if flag.starts_with('-') && flag.len() > 1 => return Err(format!("unknown option {flag} — see omanote --help")),
-            file => {
-                path = Some(PathBuf::from(file));
+            word => {
+                words.push(word.to_string());
                 continue;
             }
         };
         println!("{}", done.trim_end());
         std::process::exit(0);
     }
-    Ok((path, keys, demo))
+    Ok((target(&words), keys, demo))
 }
 
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args_os().skip(1).map(|a| a.to_string_lossy().into_owned()).collect();
-    let (path, keys, demo) = cli(&args).unwrap_or_else(|msg| {
+    let (target, keys, demo) = cli(&args).unwrap_or_else(|msg| {
         eprintln!("omanote: {msg}");
         std::process::exit(2);
     });
     let key_log = match keys {
         true => Some(std::fs::File::create(std::env::temp_dir().join("omanote-keys.log"))?),
         false => None,
+    };
+    // A name is looked up before the screen is taken over: one match is simply
+    // the file to open; several leave the list up; none means a new note.
+    let here = std::env::current_dir().ok();
+    let mut picker = None;
+    let mut wanted = None;
+    let mut greeting = None;
+    let path = match target {
+        Target::Untitled => None,
+        Target::File(path) => Some(path),
+        Target::Find(name) => {
+            let mut found = Picker::open_with(&vaults::all(&vaults::home()), here.as_deref());
+            found.push(&name);
+            match found.resolve() {
+                Resolution::Open(path) => Some(path),
+                Resolution::Choose => {
+                    picker = Some(found);
+                    None
+                }
+                Resolution::Nothing => {
+                    greeting = Some(format!("No note called “{name}” — this is a new one"));
+                    wanted = Some(name);
+                    None
+                }
+            }
+        }
     };
     let text = match &path {
         Some(p) if p.exists() => std::fs::read_to_string(p)?,
@@ -476,8 +603,11 @@ fn main() -> std::io::Result<()> {
     let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
     let mut app = App {
         ed: Editor::new("", None),
-        picker: None,
+        picker,
         save_as: None,
+        wanted,
+        sync: sync::Sync::new(vaults::home()),
+        seen_saves: 0,
         toast: None,
         last_click: None,
         enhanced_keys,
@@ -485,14 +615,23 @@ fn main() -> std::io::Result<()> {
         key_log,
         quit: false,
     };
+    if let Some(path) = &path {
+        app.sync.opened(path, &vaults::all(&vaults::home()));
+    }
     app.ed = app.editor(&text, path);
+    if let Some(msg) = greeting {
+        app.say(msg);
+    }
 
+    let all_vaults = vaults::all(&vaults::home());
     let result = (|| -> std::io::Result<()> {
         while !app.quit {
             if app.toast.as_ref().is_some_and(|(_, at)| at.elapsed() > TOAST) {
                 app.toast = None;
             }
+            app.tick();
             let toast = app.toast.as_ref().map(|(msg, _)| msg.clone());
+            let syncing = app.ed.path.as_ref().and_then(|p| app.sync.state(p, &all_vaults));
             // Images have to be in the terminal before the frame that refers to them.
             let size = terminal.size()?;
             if let Some((x, y, w, h)) = ui::text_area(ratatui::layout::Rect::new(0, 0, size.width, size.height)) {
@@ -504,7 +643,7 @@ fn main() -> std::io::Result<()> {
                     out.flush()?;
                 }
             }
-            terminal.draw(|f| ui::draw(f, &mut app.ed, app.picker.as_ref(), app.save_as.as_ref(), toast.as_deref(), app.enhanced_keys))?;
+            terminal.draw(|f| ui::draw(f, &mut app.ed, app.picker.as_ref(), app.save_as.as_ref(), toast.as_deref(), syncing, app.enhanced_keys))?;
 
             if event::poll(Duration::from_millis(250))? {
                 // Drain everything pending so a burst of input costs one redraw.

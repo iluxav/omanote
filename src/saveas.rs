@@ -18,6 +18,8 @@ pub struct SaveAs {
     pub name: String,
     pub vaults: Vec<Vault>,
     pub selected: usize,
+    /// Which entry of `vaults` is really the folder omanote was started in.
+    pub here: Option<usize>,
     pub after: After,
     /// Set after a first Enter on a name that already exists; a second Enter replaces it.
     pub confirm_replace: bool,
@@ -45,11 +47,18 @@ fn timestamp() -> String {
 }
 
 impl SaveAs {
-    pub fn new(lines: &[Vec<char>], vaults: Vec<Vault>, after: After) -> Self {
+    /// `here`: the current folder, offered after the vaults unless it is one.
+    /// `wanted`: what was asked for on the command line, used when the note has no words yet.
+    pub fn new(lines: &[Vec<char>], mut vaults: Vec<Vault>, here: Option<PathBuf>, wanted: Option<&str>, after: After) -> Self {
         // First line that has any words in it; markdown markers fall away in the slug.
         let title = lines.iter().map(|l| slug(&l.iter().collect::<String>())).find(|s| !s.is_empty());
-        let name = title.unwrap_or_else(|| format!("note-{}", timestamp()));
-        SaveAs { name, vaults, selected: 0, after, confirm_replace: false }
+        let name = title.or_else(|| wanted.map(slug).filter(|s| !s.is_empty())).unwrap_or_else(|| format!("note-{}", timestamp()));
+        let mut here_at = None;
+        if let Some(here) = here.filter(|h| !vaults.iter().any(|v| &v.path == h)) {
+            here_at = Some(vaults.len());
+            vaults.push(Vault { path: here, github: None });
+        }
+        SaveAs { name, vaults, selected: 0, here: here_at, after, confirm_replace: false }
     }
 
     pub fn edit(&mut self, change: impl FnOnce(&mut String)) {
@@ -100,13 +109,13 @@ mod tests {
         assert_eq!(slug("---"), "");
         assert_eq!(slug(&"word ".repeat(40)).chars().count(), 59, "capped, no trailing dash");
 
-        assert_eq!(SaveAs::new(&lines("\n---\n## Trip plan\nbody"), vaults(), After::Stay).name, "trip-plan");
-        assert!(SaveAs::new(&lines("\n\n"), vaults(), After::Stay).name.starts_with("note-"));
+        assert_eq!(SaveAs::new(&lines("\n---\n## Trip plan\nbody"), vaults(), None, None, After::Stay).name, "trip-plan");
+        assert!(SaveAs::new(&lines("\n\n"), vaults(), None, None, After::Stay).name.starts_with("note-"));
     }
 
     #[test]
     fn builds_a_path_inside_the_chosen_vault() {
-        let mut p = SaveAs::new(&lines("# Idea"), vaults(), After::Stay);
+        let mut p = SaveAs::new(&lines("# Idea"), vaults(), None, None, After::Stay);
         assert_eq!(p.target(), Ok("/v/docs/idea.md".into()));
         p.step(1);
         assert_eq!(p.target(), Ok("/v/work/idea.md".into()));
@@ -124,8 +133,21 @@ mod tests {
     }
 
     #[test]
+    fn offers_the_current_folder_and_the_name_that_was_asked_for() {
+        let p = SaveAs::new(&lines(""), vaults(), Some("/home/me/project".into()), Some("Trip Plan"), After::Stay);
+        assert_eq!(p.name, "trip-plan", "nothing written yet, so the command-line name is the best guess");
+        assert_eq!((p.vaults.len(), p.here, p.selected), (3, Some(2), 0), "listed last; the default vault stays preselected");
+        let mut p = SaveAs::new(&lines("# Real title"), vaults(), Some("/home/me/project".into()), Some("trip"), After::Stay);
+        assert_eq!(p.name, "real-title", "what was written wins");
+        p.step(-1);
+        assert_eq!(p.target(), Ok("/home/me/project/real-title.md".into()));
+        // Started inside a vault: not offered twice.
+        assert_eq!(SaveAs::new(&lines("x"), vaults(), Some("/v/work".into()), None, After::Stay).here, None);
+    }
+
+    #[test]
     fn editing_cancels_a_pending_replace() {
-        let mut p = SaveAs::new(&lines("x"), vaults(), After::Stay);
+        let mut p = SaveAs::new(&lines("x"), vaults(), None, None, After::Stay);
         p.confirm_replace = true;
         p.edit(|n| n.push('y'));
         assert!(!p.confirm_replace);

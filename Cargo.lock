@@ -548,6 +548,7 @@ name = "omanote"
 version = "0.0.2"
 dependencies = [
  "image",
+ "libc",
  "ratatui",
  "unicode-width 0.2.0",
  "ureq",

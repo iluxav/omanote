@@ -24,7 +24,16 @@ pub fn text_area(area: Rect) -> Option<(u16, u16, u16, u16)> {
     Some(((area.width - w) / 2, 1, w, area.height - 3))
 }
 
-pub fn draw(f: &mut Frame, ed: &mut Editor, picker: Option<&Picker>, save_as: Option<&SaveAs>, toast: Option<&str>, enhanced_keys: bool) {
+#[allow(clippy::too_many_arguments)]
+pub fn draw(
+    f: &mut Frame,
+    ed: &mut Editor,
+    picker: Option<&Picker>,
+    save_as: Option<&SaveAs>,
+    toast: Option<&str>,
+    sync: Option<&str>,
+    enhanced_keys: bool,
+) {
     let area = f.area();
     let Some((x, _, w, h)) = text_area(area) else { return };
     ed.set_view(x, 1, w, h);
@@ -62,7 +71,7 @@ pub fn draw(f: &mut Frame, ed: &mut Editor, picker: Option<&Picker>, save_as: Op
         f.set_cursor_position(xy);
     }
 
-    draw_status(f, ed, toast, Rect::new(x, area.height - 2, w, 1));
+    draw_status(f, ed, toast, sync, Rect::new(x, area.height - 2, w, 1));
     let hints = match (save_as, picker) {
         (Some(p), _) if matches!(p.after, After::Stay) => Some(vec![("Enter", "Save"), ("↑↓", "Vault"), ("Esc", "Cancel")]),
         (Some(_), _) => Some(vec![("Enter", "Save"), ("↑↓", "Vault"), ("^D", "Discard"), ("Esc", "Cancel")]),
@@ -104,6 +113,7 @@ fn draw_save_as(f: &mut Frame, p: &SaveAs, toast: Option<&str>, x: u16, w: u16, 
         let selected = i == p.selected;
         let pick = |style: Style| if selected { style.add_modifier(Modifier::REVERSED) } else { style };
         let kind = match (&vault.github, i) {
+            _ if p.here == Some(i) => "current folder".to_string(),
             (Some(repo), _) => format!("github: {repo}"),
             (None, 0) => "default".to_string(),
             (None, _) => String::new(),
@@ -218,7 +228,7 @@ pub fn human(bytes: usize) -> String {
     }
 }
 
-fn draw_status(f: &mut Frame, ed: &Editor, toast: Option<&str>, area: Rect) {
+fn draw_status(f: &mut Frame, ed: &Editor, toast: Option<&str>, sync: Option<&str>, area: Rect) {
     let dim = Style::new().fg(Color::DarkGray);
     let name = match &ed.path {
         Some(p) => p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned()),
@@ -236,7 +246,8 @@ fn draw_status(f: &mut Frame, ed: &Editor, toast: Option<&str>, area: Rect) {
         (1, bytes) => format!("1 image, {}  ·  ", human(bytes)),
         (n, bytes) => format!("{n} images, {}  ·  ", human(bytes)),
     };
-    let right = format!("{images}Ln {}, Col {}  ·  {} words", ed.cursor.row + 1, ed.cursor.col + 1, ed.word_count());
+    let sync = sync.map(|s| format!("⇅ {s}  ·  ")).unwrap_or_default();
+    let right = format!("{sync}{images}Ln {}, Col {}  ·  {} words", ed.cursor.row + 1, ed.cursor.col + 1, ed.word_count());
     let crowded = toast.is_some_and(|t| t.chars().count() + right.chars().count() + 2 > area.width as usize);
     f.render_widget(Paragraph::new(left), area);
     if !crowded {

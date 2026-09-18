@@ -39,11 +39,14 @@ make uninstall
 
 ```sh
 omanote                 # a new, empty note
-omanote notes/idea.md   # open a note, or start it if it does not exist
+omanote readme          # find a note by name and open it
+omanote notes/idea.md   # open that file, or start it if it does not exist
 omanote --demo          # a note that shows everything off
 ```
 
-Write first, name it later: on a new note `Ctrl+S` asks which vault to keep it in, with the file name prefilled from your first line (`# Trip plan` → `trip-plan.md`). From then on notes save themselves as you type.
+`omanote <name>` looks in the current folder and in every vault. Case and the `.md` do not matter, so `omanote readme` opens `README.md` and `omanote my ideas` opens `My Ideas.md`. One match opens straight away; with several you get the list (`Tab` to move, `Enter` to open); with none you get a new note, and `Ctrl+S` offers to save it under that name.
+
+Write first, name it later: on a new note `Ctrl+S` asks where to keep it (a vault, or the current folder), with the file name prefilled from your first line (`# Trip plan` → `trip-plan.md`). From then on notes save themselves as you type.
 
 | Key | |
 | --- | --- |
@@ -94,7 +97,17 @@ omanote --vls                      # list vaults
 omanote --vlrm notes               # forget a vault (files are kept)
 ```
 
-Vaults are recorded in `~/.omanote/origins.toml`. GitHub vaults are cloned into `~/.omanote/vaults`; running `--vlgh` again pulls the latest.
+Vaults are recorded in `~/.omanote/origins.toml`. GitHub vaults are cloned into `~/.omanote/vaults`.
+
+### GitHub vaults sync themselves
+
+Notes in a `--vlgh` vault are kept in step with the repo, in the background:
+
+- Opening a note pulls. You see the note straight away; if the pull changed it, it reloads.
+- Saving commits and pushes, once the note has been quiet for 30 seconds, and when you switch notes or quit. Quitting does not wait for the network: the push finishes on its own.
+- The status line shows `⇅ github`, `⇅ to sync` or `⇅ syncing…`.
+
+If the same note was changed in two places, your version is committed locally, nothing is overwritten, and omanote tells you to resolve it with git. Offline, commits wait and go out the next time you open or save a note in that vault. Set `OMANOTE_SYNC=off` to turn all of this off. Folders added with `--vl` are never committed to, even if they are git repositories.
 
 ## Development
 

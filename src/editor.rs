@@ -61,6 +61,10 @@ pub struct Editor {
     pub view: View,
     pub path: Option<PathBuf>,
     pub dirty: bool,
+    /// How many times this note has been written, and the file's timestamp as
+    /// we last knew it (to notice when something else changes it).
+    pub save_count: u64,
+    pub disk_mtime: Option<std::time::SystemTime>,
     pub last_change: Instant,
     pub clipboard: String,
     goal_x: Option<u16>,
@@ -106,8 +110,10 @@ impl Editor {
             embeds,
             embedded: (0, 0),
             view: View { w: 80, h: 24, ..View::default() },
+            disk_mtime: path.as_ref().and_then(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok()),
             path,
             dirty: false,
+            save_count: 0,
             last_change: Instant::now(),
             clipboard: String::new(),
             goal_x: None,
@@ -187,6 +193,8 @@ impl Editor {
             std::fs::create_dir_all(dir)?;
         }
         std::fs::write(path, self.text())?;
+        self.disk_mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+        self.save_count += 1;
         self.dirty = false;
         Ok(true)
     }
