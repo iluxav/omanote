@@ -1,0 +1,15 @@
+[package]
+name = "omanote"
+version = "0.0.1"
+edition = "2024"
+
+[dependencies]
+ratatui = "0.29"
+unicode-width = "0.2"
+ureq = "2"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
