@@ -3,6 +3,7 @@
 #   make install                       build, then copy to ~/.local/bin (no sudo needed)
 #   make uninstall                     remove it again
 #   make && sudo make install PREFIX=/usr/local     system-wide
+#   make bump VERSION=0.1.0            set the version in Cargo.toml and Cargo.lock (then commit both)
 #   make release                       tag the version in Cargo.toml and push the tag;
 #                                      GitHub Actions then builds and publishes it
 
@@ -15,7 +16,7 @@ TAG     := v$(VERSION)
 REMOTE  ?= origin
 SOURCES := Cargo.toml Cargo.lock demo.md $(wildcard src/*.rs)
 
-.PHONY: build install uninstall test clean help release
+.PHONY: build install uninstall test clean help bump release
 
 build: $(BIN)
 
@@ -42,6 +43,15 @@ uninstall:
 test:
 	cargo test
 
+# Cargo.lock records the package version too, and the release build uses
+# --locked, so the two have to change together.
+bump:
+	@test "$(origin VERSION)" = "command line" || { echo "usage: make bump VERSION=0.1.0"; exit 1; }
+	@echo "$(VERSION)" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$$' || { echo "bump: '$(VERSION)' is not a version like 0.1.0"; exit 1; }
+	@sed -i.bak -e '1,/^version = /s/^version = ".*"/version = "$(VERSION)"/' Cargo.toml && rm -f Cargo.toml.bak
+	@cargo update --offline -p $(NAME) >/dev/null 2>&1 || cargo update -p $(NAME) >/dev/null
+	@echo "Version is now $(VERSION). Commit Cargo.toml and Cargo.lock, then: make release"
+
 # Tags what is committed; it never commits for you. Bump `version` in
 # Cargo.toml and commit first, then run this.
 release:
@@ -60,4 +70,4 @@ clean:
 	cargo clean
 
 help:
-	@sed -n '1,8p' Makefile
+	@sed -n '1,9p' Makefile
