@@ -130,6 +130,13 @@ impl Images {
         self.stale = true;
     }
 
+    /// The note got a file (or moved): relative image paths resolve from there now.
+    pub fn set_note(&mut self, note: &Path, vault: PathBuf) {
+        let dir = note.parent().map(Path::to_path_buf).filter(|d| !d.as_os_str().is_empty());
+        self.dirs = vec![dir.unwrap_or_else(|| PathBuf::from(".")), vault];
+        self.stale = true;
+    }
+
     pub fn set_cell(&mut self, cell: (u16, u16)) {
         let cell = (cell.0.max(1) as u32, cell.1.max(1) as u32);
         if cell != self.cell {

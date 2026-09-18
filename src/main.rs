@@ -5,6 +5,7 @@ mod images;
 mod layout;
 mod markdown;
 mod picker;
+mod saveas;
 mod table;
 mod ui;
 mod vaults;
@@ -30,6 +31,7 @@ use ratatui::crossterm::terminal::{
 use editor::{Editor, Pos};
 use images::Images;
 use picker::Picker;
+use saveas::{After, SaveAs};
 
 const DEMO: &str = include_str!("../demo.md");
 const AUTOSAVE_IDLE: Duration = Duration::from_millis(1500);
@@ -41,6 +43,7 @@ const PASTE_MAX_WIDTH: u32 = 2000;
 struct App {
     ed: Editor,
     picker: Option<Picker>,
+    save_as: Option<SaveAs>,
     toast: Option<(String, Instant)>,
     last_click: Option<(Instant, Pos)>,
     enhanced_keys: bool,
@@ -58,13 +61,95 @@ impl App {
     fn save(&mut self) {
         match self.ed.save() {
             Ok(true) => self.say("Saved"),
-            Ok(false) => self.say("Demo buffer — run `omanote notes.md` to edit a real file"),
+            Ok(false) => self.ask_where(After::Stay),
             Err(e) => self.say(format!("Could not save: {e}")),
+        }
+    }
+
+    /// A note without a file that has something in it worth keeping.
+    fn unsaved_draft(&self) -> bool {
+        self.ed.path.is_none() && self.ed.dirty && self.ed.lines.iter().any(|l| l.iter().any(|c| !c.is_whitespace()))
+    }
+
+    fn ask_where(&mut self, after: After) {
+        self.picker = None;
+        self.save_as = Some(SaveAs::new(&self.ed.lines, vaults::all(&vaults::home()), after));
+    }
+
+    fn carry_on(&mut self, after: After) {
+        match after {
+            After::Stay => {}
+            After::Quit => self.quit = true,
+            After::Open(path) => self.open(path),
+        }
+    }
+
+    fn save_as_key(&mut self, key: KeyEvent) {
+        let Some(prompt) = &mut self.save_as else { return };
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let delete_word = |name: &mut String| {
+            let cut = name.trim_end().rfind(|c: char| !c.is_alphanumeric()).map_or(0, |i| i + 1);
+            name.truncate(cut);
+        };
+        match key.code {
+            KeyCode::Esc => self.save_as = None,
+            KeyCode::Up | KeyCode::BackTab => prompt.step(-1),
+            KeyCode::Down | KeyCode::Tab => prompt.step(1),
+            KeyCode::Backspace if ctrl || alt => prompt.edit(delete_word),
+            KeyCode::Backspace => prompt.edit(|n| {
+                n.pop();
+            }),
+            KeyCode::Char(c) if ctrl => match c.to_ascii_lowercase() {
+                'c' | 'g' => self.save_as = None,
+                'u' => prompt.edit(String::clear),
+                'w' | 'h' => prompt.edit(delete_word),
+                // Only offered when the prompt interrupted quitting or switching notes.
+                'd' if !matches!(prompt.after, After::Stay) => {
+                    let after = self.save_as.take().map(|p| p.after).unwrap_or(After::Stay);
+                    self.ed.dirty = false;
+                    self.carry_on(after);
+                }
+                _ => {}
+            },
+            KeyCode::Char(c) if !alt => prompt.edit(|n| n.push(c)),
+            KeyCode::Enter => self.save_as_confirm(),
+            _ => {}
+        }
+    }
+
+    fn save_as_confirm(&mut self) {
+        let Some(prompt) = &mut self.save_as else { return };
+        let path = match prompt.target() {
+            Ok(path) => path,
+            Err(msg) => return self.say(msg),
+        };
+        if path.exists() && !prompt.confirm_replace {
+            prompt.confirm_replace = true;
+            let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+            return self.say(format!("{name} exists — Enter again to replace it, or rename"));
+        }
+        let vault = prompt.vaults[prompt.selected].path.clone();
+        self.ed.path = Some(path.clone());
+        match self.ed.save() {
+            Ok(_) => {
+                self.ed.images.set_note(&path, vault);
+                self.say(format!("Saved to {}", vaults::tilde(&path)));
+                let after = self.save_as.take().map(|p| p.after).unwrap_or(After::Stay);
+                self.carry_on(after);
+            }
+            Err(e) => {
+                self.ed.path = None;
+                self.say(format!("Could not save there: {e}"));
+            }
         }
     }
 
     /// Switch to another note, saving the current one first.
     fn open(&mut self, path: PathBuf) {
+        if self.unsaved_draft() {
+            return self.ask_where(After::Open(path));
+        }
         if self.ed.dirty && self.ed.path.is_some() {
             if let Err(e) = self.ed.save() {
                 return self.say(format!("Could not save, staying here: {e}"));
@@ -117,6 +202,9 @@ impl App {
     }
 
     fn quit(&mut self) {
+        if self.unsaved_draft() {
+            return self.ask_where(After::Quit);
+        }
         if self.ed.dirty && self.ed.path.is_some() {
             self.save();
         }
@@ -132,6 +220,9 @@ impl App {
         }
         if key.kind == KeyEventKind::Release {
             return;
+        }
+        if self.save_as.is_some() {
+            return self.save_as_key(key);
         }
         if self.picker.is_some() {
             return self.picker_key(key);
@@ -224,6 +315,14 @@ impl App {
     }
 
     fn mouse(&mut self, m: MouseEvent) {
+        if let Some(prompt) = &mut self.save_as {
+            match m.kind {
+                MouseEventKind::ScrollUp => prompt.step(-1),
+                MouseEventKind::ScrollDown => prompt.step(1),
+                _ => {}
+            }
+            return;
+        }
         if let Some(p) = &mut self.picker {
             match m.kind {
                 MouseEventKind::ScrollUp => p.step(-1),
@@ -265,9 +364,10 @@ impl App {
             Event::Key(key) => self.key(key),
             Event::Mouse(m) => self.mouse(m),
             Event::Resize(..) => self.ed.images.set_cell(cell_pixels()),
-            Event::Paste(text) => match &mut self.picker {
-                Some(p) => p.push(&text),
-                None => self.ed.insert_str(&text),
+            Event::Paste(text) => match (&mut self.save_as, &mut self.picker) {
+                (Some(prompt), _) => prompt.edit(|n| n.extend(text.chars().filter(|c| !c.is_control()))),
+                (None, Some(p)) => p.push(&text),
+                (None, None) => self.ed.insert_str(&text),
             },
             _ => {}
         }
@@ -295,8 +395,9 @@ fn restore_terminal(enhanced_keys: bool) {
 const HELP: &str = "\
 omanote — a small markdown note editor
 
-  omanote                     open the demo note
+  omanote                     start a new note; Ctrl+S asks where to keep it
   omanote <file.md>           open (or start) a note
+  omanote --demo              a note that shows off what the editor renders
   Ctrl+P inside the editor    fuzzy-find a note in any vault
 
 Vaults (where Ctrl+P looks; new notes go in ~/.omanote/docs):
@@ -310,9 +411,9 @@ Vaults (where Ctrl+P looks; new notes go in ~/.omanote/docs):
 ";
 
 /// Handle the flags that do their job and exit. Returns what is left: the note to open.
-fn cli(args: &[String]) -> Result<(Option<PathBuf>, bool), String> {
+fn cli(args: &[String]) -> Result<(Option<PathBuf>, bool, bool), String> {
     let home = vaults::home();
-    let (mut path, mut keys) = (None, false);
+    let (mut path, mut keys, mut demo) = (None, false, false);
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         let mut value = |what: &str| it.next().cloned().ok_or(format!("{arg} needs {what}"));
@@ -326,6 +427,10 @@ fn cli(args: &[String]) -> Result<(Option<PathBuf>, bool), String> {
                 keys = true;
                 continue;
             }
+            "--demo" => {
+                demo = true;
+                continue;
+            }
             flag if flag.starts_with('-') && flag.len() > 1 => return Err(format!("unknown option {flag} — see omanote --help")),
             file => {
                 path = Some(PathBuf::from(file));
@@ -335,12 +440,12 @@ fn cli(args: &[String]) -> Result<(Option<PathBuf>, bool), String> {
         println!("{}", done.trim_end());
         std::process::exit(0);
     }
-    Ok((path, keys))
+    Ok((path, keys, demo))
 }
 
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args_os().skip(1).map(|a| a.to_string_lossy().into_owned()).collect();
-    let (path, keys) = cli(&args).unwrap_or_else(|msg| {
+    let (path, keys, demo) = cli(&args).unwrap_or_else(|msg| {
         eprintln!("omanote: {msg}");
         std::process::exit(2);
     });
@@ -351,7 +456,8 @@ fn main() -> std::io::Result<()> {
     let text = match &path {
         Some(p) if p.exists() => std::fs::read_to_string(p)?,
         Some(_) => String::new(),
-        None => DEMO.to_string(),
+        None if demo => DEMO.to_string(),
+        None => String::new(),
     };
 
     enable_raw_mode()?;
@@ -371,6 +477,7 @@ fn main() -> std::io::Result<()> {
     let mut app = App {
         ed: Editor::new("", None),
         picker: None,
+        save_as: None,
         toast: None,
         last_click: None,
         enhanced_keys,
@@ -397,7 +504,7 @@ fn main() -> std::io::Result<()> {
                     out.flush()?;
                 }
             }
-            terminal.draw(|f| ui::draw(f, &mut app.ed, app.picker.as_ref(), toast.as_deref(), app.enhanced_keys))?;
+            terminal.draw(|f| ui::draw(f, &mut app.ed, app.picker.as_ref(), app.save_as.as_ref(), toast.as_deref(), app.enhanced_keys))?;
 
             if event::poll(Duration::from_millis(250))? {
                 // Drain everything pending so a burst of input costs one redraw.

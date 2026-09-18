@@ -1,7 +1,7 @@
 #!/bin/sh
 # omanote installer.
 #
-#   curl -fsSL https://raw.githubusercontent.com/iluxav/omanote/master/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/iluxav/omanote/main/install.sh | sh
 #
 # Downloads the latest release binary for this machine, checks its checksum and
 # puts it in ~/.local/bin. Options, as environment variables:

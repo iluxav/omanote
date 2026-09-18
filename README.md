@@ -1,3 +1,5 @@
+<img src="assets/icon.svg" width="96" align="right" alt="omanote icon">
+
 # omanote
 
 A small markdown note editor for the terminal. Think *nano for markdown*: open it and type. There are no modes and nothing to configure, and it is a single binary.
@@ -7,7 +9,7 @@ Markdown renders as you write. Headings, **bold**, links, checkboxes, tables and
 ## Install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/iluxav/omanote/master/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/iluxav/omanote/main/install.sh | sh
 ```
 
 This downloads the latest release for your machine (Linux or macOS, x86_64 or ARM), verifies its checksum and puts `omanote` in `~/.local/bin`.
@@ -20,7 +22,7 @@ This downloads the latest release for your machine (Linux or macOS, x86_64 or AR
 Uninstall (your notes are kept):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/iluxav/omanote/master/install.sh | sh -s -- --uninstall
+curl -fsSL https://raw.githubusercontent.com/iluxav/omanote/main/install.sh | sh -s -- --uninstall
 ```
 
 ### From source
@@ -36,11 +38,12 @@ make uninstall
 ## Use
 
 ```sh
-omanote                 # a demo note that shows everything off
+omanote                 # a new, empty note
 omanote notes/idea.md   # open a note, or start it if it does not exist
+omanote --demo          # a note that shows everything off
 ```
 
-Notes save themselves as you type.
+Write first, name it later: on a new note `Ctrl+S` asks which vault to keep it in, with the file name prefilled from your first line (`# Trip plan` → `trip-plan.md`). From then on notes save themselves as you type.
 
 | Key | |
 | --- | --- |

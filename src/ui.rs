@@ -9,6 +9,8 @@ use ratatui::widgets::{Clear, Paragraph};
 use crate::editor::{Editor, Pos};
 use crate::layout::{VRow, locate};
 use crate::picker::{Picker, Row, age};
+use crate::saveas::{After, SaveAs};
+use crate::vaults::tilde;
 
 const MAX_WIDTH: u16 = 84;
 const PICKER_ROWS: usize = 8;
@@ -22,7 +24,7 @@ pub fn text_area(area: Rect) -> Option<(u16, u16, u16, u16)> {
     Some(((area.width - w) / 2, 1, w, area.height - 3))
 }
 
-pub fn draw(f: &mut Frame, ed: &mut Editor, picker: Option<&Picker>, toast: Option<&str>, enhanced_keys: bool) {
+pub fn draw(f: &mut Frame, ed: &mut Editor, picker: Option<&Picker>, save_as: Option<&SaveAs>, toast: Option<&str>, enhanced_keys: bool) {
     let area = f.area();
     let Some((x, _, w, h)) = text_area(area) else { return };
     ed.set_view(x, 1, w, h);
@@ -61,10 +63,67 @@ pub fn draw(f: &mut Frame, ed: &mut Editor, picker: Option<&Picker>, toast: Opti
     }
 
     draw_status(f, ed, toast, Rect::new(x, area.height - 2, w, 1));
-    draw_hints(f, picker.is_some(), enhanced_keys, Rect::new(x, area.height - 1, w, 1));
-    if let Some(picker) = picker {
+    let hints = match (save_as, picker) {
+        (Some(p), _) if matches!(p.after, After::Stay) => Some(vec![("Enter", "Save"), ("↑↓", "Vault"), ("Esc", "Cancel")]),
+        (Some(_), _) => Some(vec![("Enter", "Save"), ("↑↓", "Vault"), ("^D", "Discard"), ("Esc", "Cancel")]),
+        (None, Some(_)) => Some(vec![("↑↓", "Select"), ("Enter", "Open"), ("Esc", "Cancel"), ("^U", "Clear")]),
+        (None, None) => None,
+    };
+    draw_hints(f, hints, enhanced_keys, Rect::new(x, area.height - 1, w, 1));
+    if let Some(prompt) = save_as {
+        draw_save_as(f, prompt, toast, x, w, area.height - 1);
+    } else if let Some(picker) = picker {
         draw_picker(f, picker, x, w, area.height - 1);
     }
+}
+
+/// Same place and shape as the picker: title rule, the name being typed, the vaults.
+fn draw_save_as(f: &mut Frame, p: &SaveAs, toast: Option<&str>, x: u16, w: u16, bottom: u16) {
+    let dim = Style::new().fg(Color::DarkGray);
+    let shown = p.vaults.len().clamp(1, PICKER_ROWS).min(bottom.saturating_sub(4) as usize);
+    let h = shown as u16 + 3;
+    let area = Rect::new(x, bottom - h, w, h);
+    f.render_widget(Clear, Rect::new(0, area.y, f.area().width, h));
+
+    let title = match p.after {
+        After::Stay => "── Save note ",
+        After::Quit => "── Save before quitting? ",
+        After::Open(_) => "── Save this note first? ",
+    };
+    let label = "  Name › ";
+    let mut lines = vec![
+        Line::styled(format!("{title}{}", "─".repeat((w as usize).saturating_sub(title.chars().count()))), dim),
+        Line::from(vec![Span::styled(label, Style::new().fg(Color::Magenta)), Span::raw(p.name.clone()), Span::styled(".md", dim)]),
+        match toast {
+            Some(msg) => Line::styled(format!("  {msg}"), Style::new().fg(Color::Yellow)),
+            None => Line::styled("  Vault", dim),
+        },
+    ];
+    let first = p.selected.saturating_sub(shown - 1);
+    for (i, vault) in p.vaults.iter().enumerate().skip(first).take(shown) {
+        let selected = i == p.selected;
+        let pick = |style: Style| if selected { style.add_modifier(Modifier::REVERSED) } else { style };
+        let kind = match (&vault.github, i) {
+            (Some(repo), _) => format!("github: {repo}"),
+            (None, 0) => "default".to_string(),
+            (None, _) => String::new(),
+        };
+        // A long path loses its front: the end is what tells vaults apart.
+        let room = (w as usize).saturating_sub(kind.chars().count() + 6).max(8);
+        let path = tilde(&vault.path);
+        let count = path.chars().count();
+        let path = if count > room { format!("…{}", path.chars().skip(count - room + 1).collect::<String>()) } else { path };
+        let left = format!("{}{path}", if selected { " ▸ " } else { "   " });
+        let fill = (w as usize).saturating_sub(left.chars().count() + kind.chars().count() + 1);
+        lines.push(Line::from(vec![
+            Span::styled(left, pick(Style::default())),
+            Span::styled(" ".repeat(fill), pick(Style::default())),
+            Span::styled(format!("{kind} "), pick(dim)),
+        ]));
+    }
+    f.render_widget(Paragraph::new(lines), area);
+    let cx = x + label.chars().count() as u16 + unicode_width::UnicodeWidthStr::width(p.name.as_str()) as u16;
+    f.set_cursor_position((cx.min(x + w - 1), area.y + 1));
 }
 
 /// A panel growing up from the hint bar: title rule, query line, results.
@@ -163,7 +222,7 @@ fn draw_status(f: &mut Frame, ed: &Editor, toast: Option<&str>, area: Rect) {
     let dim = Style::new().fg(Color::DarkGray);
     let name = match &ed.path {
         Some(p) => p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned()),
-        None => "demo (not saved anywhere)".to_string(),
+        None => "untitled".to_string(),
     };
     let left = match toast {
         Some(msg) => Line::from(Span::styled(msg.to_string(), Style::new().fg(Color::Yellow))),
@@ -178,19 +237,22 @@ fn draw_status(f: &mut Frame, ed: &Editor, toast: Option<&str>, area: Rect) {
         (n, bytes) => format!("{n} images, {}  ·  ", human(bytes)),
     };
     let right = format!("{images}Ln {}, Col {}  ·  {} words", ed.cursor.row + 1, ed.cursor.col + 1, ed.word_count());
+    let crowded = toast.is_some_and(|t| t.chars().count() + right.chars().count() + 2 > area.width as usize);
     f.render_widget(Paragraph::new(left), area);
-    f.render_widget(Paragraph::new(Line::styled(right, dim)).right_aligned(), area);
+    if !crowded {
+        f.render_widget(Paragraph::new(Line::styled(right, dim)).right_aligned(), area);
+    }
 }
 
-fn draw_hints(f: &mut Frame, picking: bool, enhanced_keys: bool, area: Rect) {
+fn draw_hints(f: &mut Frame, modal: Option<Vec<(&'static str, &'static str)>>, enhanced_keys: bool, area: Rect) {
     let mut hints = vec![("^Q", "Quit"), ("^P", "Open"), ("^S", "Save"), ("^Z", "Undo"), ("^Y", "Redo"), ("^C", "Copy"), ("^X", "Cut"), ("^V", "Paste"), ("^B", "Bold")];
     if enhanced_keys {
         // Without the kitty keyboard protocol Ctrl+I is indistinguishable from Tab.
         hints.push(("^I", "Italic"));
     }
     hints.push(("^T", "Task"));
-    if picking {
-        hints = vec![("↑↓", "Select"), ("Enter", "Open"), ("Esc", "Cancel"), ("^U", "Clear")];
+    if let Some(modal) = modal {
+        hints = modal;
     }
     let mut spans = Vec::new();
     let mut used = 0;
