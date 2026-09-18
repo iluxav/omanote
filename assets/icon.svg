@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <!-- Hyprland-style active border, in the colours of a synthwave sunset -->
+    <linearGradient id="border" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#F2F08D"/>
+      <stop offset="0.35" stop-color="#EE7A66"/>
+      <stop offset="0.7" stop-color="#DD3F7B"/>
+      <stop offset="1" stop-color="#5E4190"/>
+    </linearGradient>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#261843"/>
+      <stop offset="0.6" stop-color="#3A1442"/>
+      <stop offset="1" stop-color="#551E46"/>
+    </linearGradient>
+    <linearGradient id="hash" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#F2F08D"/>
+      <stop offset="1" stop-color="#EE7A66"/>
+    </linearGradient>
+    <linearGradient id="sun" gradientUnits="userSpaceOnUse" x1="0" y1="318" x2="0" y2="484">
+      <stop offset="0" stop-color="#F2F08D"/>
+      <stop offset="0.5" stop-color="#EE7A66"/>
+      <stop offset="1" stop-color="#DD3F7B"/>
+    </linearGradient>
+    <clipPath id="inside"><rect x="28" y="28" width="456" height="456" rx="28"/></clipPath>
+    <!-- the sun, minus the horizontal bands that slice through its lower half -->
+    <mask id="bands">
+      <rect width="512" height="512" fill="white"/>
+      <g fill="black">
+        <rect x="0" y="388" width="512" height="7"/>
+        <rect x="0" y="412" width="512" height="10"/>
+        <rect x="0" y="438" width="512" height="13"/>
+        <rect x="0" y="466" width="512" height="18"/>
+      </g>
+    </mask>
+  </defs>
+
+  <!-- the window: dusk sky -->
+  <rect x="22" y="22" width="468" height="468" rx="34" fill="url(#tile)"/>
+  <g clip-path="url(#inside)">
+    <circle cx="256" cy="478" r="160" fill="url(#sun)" mask="url(#bands)"/>
+  </g>
+  <rect x="22" y="22" width="468" height="468" rx="34" fill="none" stroke="url(#border)" stroke-width="12"/>
+
+  <!-- "# Heading": the markdown mark, drawn from bars so it needs no font -->
+  <g fill="url(#hash)">
+    <rect x="116" y="92" width="20" height="104" rx="6"/>
+    <rect x="160" y="92" width="20" height="104" rx="6"/>
+    <rect x="96" y="116" width="104" height="20" rx="6"/>
+    <rect x="96" y="152" width="104" height="20" rx="6"/>
+  </g>
+  <rect x="232" y="120" width="184" height="30" rx="8" fill="#FBE3D2"/>
+  <rect x="232" y="164" width="184" height="8" rx="4" fill="#EE7A66" opacity="0.75"/>
+
+  <!-- the line being written: a task, some text, the cursor -->
+  <rect x="100" y="232" width="52" height="52" rx="10" fill="none" stroke="#DD3F7B" stroke-width="10"/>
+  <rect x="184" y="246" width="136" height="24" rx="8" fill="#FBE3D2"/>
+  <rect x="336" y="226" width="18" height="64" rx="5" fill="#F2F08D"/>
+</svg>
