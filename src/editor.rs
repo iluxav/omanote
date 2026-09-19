@@ -52,6 +52,9 @@ pub struct Editor {
     pub top: usize,
     pub top_skip: usize,
     pub images: Images,
+    /// How wide a table may get: the text column, plus whatever window is free
+    /// to its right. 0 = just the text column.
+    pub table_w: u16,
     /// Images embedded in the note as `[label]: data:…` definitions. They are
     /// kept out of `lines` (one can be a megabyte of base64) and written back
     /// at the end of the file on save, for as long as the text refers to them.
@@ -107,6 +110,7 @@ impl Editor {
             top: 0,
             top_skip: 0,
             images: Images::off(),
+            table_w: 0,
             embeds,
             embedded: (0, 0),
             view: View { w: 80, h: 24, ..View::default() },
@@ -308,6 +312,10 @@ impl Editor {
                 widths[k] = widths[k].max(w);
             }
         }
+        // Too wide for the window: squeeze the columns, the cells wrap.
+        let room = if self.table_w > 0 { self.table_w } else { self.view.w };
+        let indent = self.lines[start].iter().take_while(|c| **c == ' ' || **c == '\t').count() as u16;
+        let widths = table::fit(&widths, room.saturating_sub(indent + widths.len() as u16 + 1));
         table::Ctx {
             widths,
             aligns: table::aligns(&self.lines[start + 1]),
@@ -1221,6 +1229,32 @@ mod tests {
             e.up(false);
             assert_eq!(e.cursor.row, expected);
         }
+    }
+
+    #[test]
+    fn tables_shrink_to_the_window_and_arrows_walk_the_wrapped_lines() {
+        let mut e = ed("| Part | Notes |\n|---|---|\n| CPU | six cores and twelve threads in one socket |\nafter");
+        e.set_view(0, 0, 30, 20);
+        let body = e.rows(2, false);
+        assert!(body.iter().filter(|r| !r.virt).count() >= 3, "wrapped into several lines");
+        let width = |r: &VRow| r.lead_w + r.cells.iter().map(|c| c.width).sum::<u16>();
+        assert!(body.iter().all(|r| width(r) <= 30), "and no wider than the window");
+
+        // Given room (a wide tile, or free window beside the text column) it does not wrap.
+        e.table_w = 80;
+        assert_eq!(e.rows(2, false).iter().filter(|r| !r.virt).count(), 1);
+        e.table_w = 0;
+
+        // Down from the header walks through the wrapped lines of the row, then out.
+        e.move_to(Pos { row: 0, col: 9 }, false);
+        let mut seen = Vec::new();
+        for _ in 0..6 {
+            e.down(false);
+            seen.push(e.cursor.row);
+        }
+        assert_eq!(seen[0], 2, "{seen:?}");
+        assert!(seen.iter().filter(|r| **r == 2).count() >= 3, "{seen:?}");
+        assert_eq!(*seen.last().unwrap(), 3, "{seen:?}");
     }
 
     #[test]

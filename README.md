@@ -52,6 +52,7 @@ Write first, name it later: on a new note `Ctrl+S` asks where to keep it (a vaul
 | --- | --- |
 | `Ctrl+P` | find a note by fuzzy search, or create one |
 | `Ctrl+S` / `Ctrl+Q` | save / quit |
+| `F2` | move, rename or copy the note: another vault, another folder, another name |
 | `Ctrl+Z` / `Ctrl+Y` | undo / redo |
 | `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | copy / cut / paste |
 | `Shift+arrows`, `Ctrl+A` | select |
@@ -73,6 +74,8 @@ Type a header row such as `| Item | Price |` and press `Enter`; the rest of the 
 | `Shift+Enter` | insert a row below |
 | `Alt+Shift+→` / `Alt+Shift+←` | insert a column |
 
+A table wider than the window shrinks to fit: its columns narrow and long cells wrap onto several lines.
+
 ### Images
 
 A line that is only an image shows the picture underneath it:
@@ -85,6 +88,18 @@ A line that is only an image shows the picture underneath it:
 Paste a screenshot with `Ctrl+V` and it is embedded in the note itself, so the file stays self-contained.
 
 Real images need a terminal with the Kitty graphics protocol (Ghostty, Kitty). Other terminals get a low-resolution preview made of coloured blocks. Remote images are downloaded in the background and cached; set `OMANOTE_REMOTE_IMAGES=off` to never fetch them.
+
+## Settings
+
+`omanote --config` prints the path of the settings file (`~/.omanote/config.toml`), creating it with comments if it is not there yet:
+
+```toml
+width = 84          # widest the text column gets; 0 = the whole window
+align = "center"    # where the column sits in a wide window: "left", "center", "right"
+margin = 2          # blank columns kept at the window's edges
+```
+
+Changes apply the next time you start omanote. `Ctrl+L` repaints the screen if a terminal ever garbles it.
 
 ## Vaults
 

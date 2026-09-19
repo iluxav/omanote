@@ -14,6 +14,9 @@ pub struct Cell {
     pub text: String,
     pub width: u16,
     pub style: Style,
+    /// Stands for exactly one source character. Padding and table rules are not
+    /// solid: they repeat a column number and must not attract the cursor.
+    pub solid: bool,
 }
 
 pub struct VRow {
@@ -60,9 +63,20 @@ impl VRow {
     }
 }
 
-/// Index of the visual row that holds cursor column `col`.
+/// Index of the visual row that holds cursor column `col`: the row showing
+/// that character, or else the nearest character before it. (Not simply "the
+/// row whose range contains it": a wrapped table row interleaves the ranges of
+/// its cells across its visual rows.)
 pub fn locate(rows: &[VRow], col: usize) -> usize {
-    rows.iter().rposition(|r| !r.virt && r.start <= col).unwrap_or(0)
+    let mut best: Option<(usize, usize)> = None;
+    for (i, row) in rows.iter().enumerate().filter(|(_, r)| !r.virt) {
+        for cell in row.cells.iter().filter(|c| c.solid && c.col <= col) {
+            if best.is_none_or(|(at, _)| cell.col > at) {
+                best = Some((cell.col, i));
+            }
+        }
+    }
+    best.map(|(_, i)| i).or_else(|| rows.iter().position(|r| !r.virt)).unwrap_or(0)
 }
 
 pub fn layout(chars: &[char], block: Block, revealed: bool, width: u16) -> Vec<VRow> {
@@ -73,7 +87,7 @@ pub fn layout(chars: &[char], block: Block, revealed: bool, width: u16) -> Vec<V
     let prefix_w = sl.prefix.map_or(0, |(t, _)| t.width() as u16);
 
     if sl.rule && !revealed {
-        let cell = Cell { col: 0, text: "─".repeat(width as usize), width, style: marker() };
+        let cell = Cell { col: 0, text: "─".repeat(width as usize), width, style: marker(), solid: true };
         return vec![VRow { lead: prefix, lead_w: prefix_w, cells: vec![cell], start: 0, end: n, last: true, virt: false }];
     }
 
@@ -89,7 +103,7 @@ pub fn layout(chars: &[char], block: Block, revealed: bool, width: u16) -> Vec<V
             _ => ch.to_string(),
         };
         let width = text.width() as u16;
-        cells.push(Cell { col, text, width, style: cc.style });
+        cells.push(Cell { col, text, width, style: cc.style, solid: true });
     }
 
     let mut hang_w: u16 = cells.iter().filter(|c| c.col < sl.hang_col).map(|c| c.width).sum();

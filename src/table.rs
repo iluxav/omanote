@@ -15,6 +15,8 @@ use crate::layout::{Cell, VRow};
 use crate::markdown::{CharCell, indent, inline, marker};
 
 const MIN_WIDTH: u16 = 3;
+/// A column squeezed to fit the window never gets narrower than this.
+const MIN_FITTED: u16 = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Align {
@@ -144,7 +146,7 @@ fn content(chars: &[char], cc: &[CharCell], a: usize, b: usize, revealed: bool) 
                 (_, Some(repl)) if !revealed => repl.to_string(),
                 (c, _) => c.to_string(),
             };
-            Cell { col, width: text.as_str().width() as u16, text, style: cc[col].style }
+            Cell { col, width: text.as_str().width() as u16, text, style: cc[col].style, solid: true }
         })
         .collect()
 }
@@ -200,7 +202,7 @@ pub fn add_column(chars: &[char], k: usize, after: bool, separator: bool) -> Vec
 }
 
 fn pad(col: usize, n: u16, fill: &str, style: Style) -> Cell {
-    Cell { col, text: fill.repeat(n as usize), width: n, style }
+    Cell { col, text: fill.repeat(n as usize), width: n, style, solid: false }
 }
 
 fn border(chars: &[char], ctx: &Ctx, left: &str, mid: &str, right: &str) -> VRow {
@@ -208,6 +210,60 @@ fn border(chars: &[char], ctx: &Ctx, left: &str, mid: &str, right: &str) -> VRow
     let text = format!("{}{left}{}{right}", " ".repeat(indent(chars)), bars.join(mid));
     let lead_w = text.as_str().width() as u16;
     VRow { lead: vec![(text, marker())], lead_w, cells: Vec::new(), start: 0, end: 0, last: false, virt: true }
+}
+
+/// Shrink columns so the table fits in `avail` cells of content (borders not
+/// counted). Narrow columns keep their width; the wide ones share what is left.
+pub fn fit(natural: &[u16], avail: u16) -> Vec<u16> {
+    let mut widths = natural.to_vec();
+    if natural.iter().map(|w| *w as u32).sum::<u32>() <= avail as u32 {
+        return widths;
+    }
+    let mut order: Vec<usize> = (0..natural.len()).collect();
+    order.sort_by_key(|&i| natural[i]);
+    let mut left = avail;
+    for (done, &i) in order.iter().enumerate() {
+        let share = left / (natural.len() - done) as u16;
+        widths[i] = natural[i].min(share.max(MIN_FITTED));
+        left = left.saturating_sub(widths[i]);
+    }
+    widths
+}
+
+/// Break a cell's text into lines, at spaces where it can: the first of at
+/// most `first` cells, the others of `rest`. The space a line breaks on is not
+/// drawn (it is still in the source).
+fn wrap(cells: Vec<Cell>, first: u16, rest: u16) -> Vec<Vec<Cell>> {
+    let mut lines: Vec<Vec<Cell>> = Vec::new();
+    let mut cur: Vec<Cell> = Vec::new();
+    let mut cur_w = 0u16;
+    let mut brk: Option<usize> = None;
+    for cell in cells {
+        let space = cell.text == " ";
+        let width = if lines.is_empty() { first } else { rest }.max(1);
+        if !cur.is_empty() && cur_w + cell.width > width {
+            let tail = match (space, brk) {
+                (true, _) | (false, None) => Vec::new(),
+                (false, Some(b)) => cur.split_off(b).split_off(1),
+            };
+            lines.push(std::mem::replace(&mut cur, tail));
+            cur_w = cur.iter().map(|c| c.width).sum();
+            brk = None;
+            if space {
+                continue;
+            }
+        }
+        if space {
+            brk = Some(cur.len());
+        }
+        cur_w += cell.width;
+        cur.push(cell);
+    }
+    // A dropped trailing space must not leave an empty line behind.
+    if !cur.is_empty() || lines.is_empty() {
+        lines.push(cur);
+    }
+    lines
 }
 
 pub fn layout_row(chars: &[char], ctx: &Ctx, revealed: bool) -> Vec<VRow> {
@@ -225,43 +281,67 @@ pub fn layout_row(chars: &[char], ctx: &Ctx, revealed: bool) -> Vec<VRow> {
     };
     let bar = |slot: usize| {
         let col = p.get(slot).copied().unwrap_or(n);
-        Cell { col, text: glyph(slot).to_string(), width: 1, style: marker() }
+        Cell { col, text: glyph(slot).to_string(), width: 1, style: marker(), solid: false }
     };
 
-    let mut out = content(chars, &cc, 0, p.first().copied().unwrap_or(0), true);
+    // Each column as lines of cells, every line exactly the column's width.
+    let mut columns_lines: Vec<Vec<Vec<Cell>>> = Vec::with_capacity(columns);
     for (k, &w) in ctx.widths.iter().enumerate() {
-        out.push(bar(k));
-        match cs.get(k) {
-            None => out.push(pad(n, w, if ruled { "─" } else { " " }, marker())),
-            Some(cell) if ruled => out.push(pad(cell.start, w, "─", marker())),
+        let lines = match cs.get(k) {
+            None => vec![vec![pad(n, w, if ruled { "─" } else { " " }, marker())]],
+            Some(cell) if ruled => vec![vec![pad(cell.start, w, "─", marker())]],
             Some(cell) if revealed => {
                 // Raw source, then virtual padding out to the column edge.
-                let raw = content(chars, &cc, cell.start, cell.end, true);
-                let used: u16 = raw.iter().map(|c| c.width).sum();
-                out.extend(raw);
-                out.push(pad(cell.end, w.saturating_sub(used), " ", Style::default()));
+                // The source brings its own leading space; continuation lines get
+                // a virtual one so they do not sit against the grid line.
+                let lines = wrap(content(chars, &cc, cell.start, cell.end, true), w, w.saturating_sub(1));
+                let count = lines.len();
+                lines
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, mut line)| {
+                        if i > 0 {
+                            // It stands in for the space the line broke on, one column back.
+                            let at = line.first().map_or(cell.end, |c| c.col).saturating_sub(1);
+                            line.insert(0, pad(at, 1, " ", Style::default()));
+                        }
+                        let used: u16 = line.iter().map(|c| c.width).sum();
+                        // Padding sits at the line's last character (the cell's
+                        // end on the last line), so a click on it lands there.
+                        let at = if i + 1 == count { cell.end } else { line.last().map_or(cell.end, |c| c.col) };
+                        line.push(pad(at, w.saturating_sub(used), " ", Style::default()));
+                        line
+                    })
+                    .collect()
             }
             Some(cell) => {
                 let (a, b) = trim(chars, cell);
-                let text = content(chars, &cc, a, b, false);
-                let free = w.saturating_sub(2 + text.iter().map(|c| c.width).sum::<u16>());
-                let left = match ctx.aligns.get(k) {
-                    Some(Align::Right) => free,
-                    Some(Align::Center) => free / 2,
-                    _ => 0,
-                };
-                out.push(pad(a, 1 + left, " ", Style::default()));
-                out.extend(text);
-                out.push(pad(b, 1 + free - left, " ", Style::default()));
+                let lines = wrap(content(chars, &cc, a, b, false), w.saturating_sub(2), w.saturating_sub(2));
+                let count = lines.len();
+                lines
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, text)| {
+                        let free = w.saturating_sub(2 + text.iter().map(|c| c.width).sum::<u16>());
+                        let left = match ctx.aligns.get(k) {
+                            Some(Align::Right) => free,
+                            Some(Align::Center) => free / 2,
+                            _ => 0,
+                        };
+                        let first = text.first().map_or(a, |c| c.col);
+                        let last = if i + 1 == count { b } else { text.last().map_or(b, |c| c.col) };
+                        let mut line = vec![pad(first, 1 + left, " ", Style::default())];
+                        line.extend(text);
+                        line.push(pad(last, 1 + free - left, " ", Style::default()));
+                        line
+                    })
+                    .collect()
             }
-        }
+        };
+        columns_lines.push(lines);
     }
-    out.push(bar(columns));
-    if let (true, Some(&close)) = (revealed, p.get(columns)) {
-        out.extend(content(chars, &cc, close + 1, n, true));
-    }
-    out.retain(|c| c.width > 0);
 
+    let height = columns_lines.iter().map(Vec::len).max().unwrap_or(1).max(1);
     let mut rows = Vec::new();
     if ctx.top {
         rows.push(border(chars, ctx, "╭", "┬", "╮"));
@@ -269,7 +349,22 @@ pub fn layout_row(chars: &[char], ctx: &Ctx, revealed: bool) -> Vec<VRow> {
     if ctx.divider {
         rows.push(border(chars, ctx, "├", "┼", "┤"));
     }
-    rows.push(VRow { lead: Vec::new(), lead_w: 0, cells: out, start: 0, end: n, last: true, virt: false });
+    for r in 0..height {
+        let mut out = content(chars, &cc, 0, p.first().copied().unwrap_or(0), true);
+        for (k, lines) in columns_lines.iter_mut().enumerate() {
+            out.push(bar(k));
+            match lines.get_mut(r) {
+                Some(line) => out.append(line),
+                None => out.push(pad(cs.get(k).map_or(n, |c| c.end), ctx.widths[k], " ", Style::default())),
+            }
+        }
+        out.push(bar(columns));
+        if let (true, 0, Some(&close)) = (revealed, r, p.get(columns)) {
+            out.extend(content(chars, &cc, close + 1, n, true));
+        }
+        out.retain(|c| c.width > 0);
+        rows.push(VRow { lead: Vec::new(), lead_w: 0, cells: out, start: 0, end: n, last: r + 1 == height, virt: false });
+    }
     if ctx.bottom {
         rows.push(border(chars, ctx, "╰", "┴", "╯"));
     }
@@ -349,6 +444,79 @@ mod tests {
                 "╰─────┴────────╯",
             ]
         );
+    }
+
+    #[test]
+    fn narrow_columns_keep_their_width_and_wide_ones_share() {
+        assert_eq!(fit(&[10, 20, 30], 80), [10, 20, 30], "fits: untouched");
+        assert_eq!(fit(&[10, 60, 60], 70), [10, 30, 30]);
+        assert_eq!(fit(&[5, 100], 45), [5, 40]);
+        assert_eq!(fit(&[40, 40, 40], 12), [8, 8, 8], "never below the minimum, even if that overflows");
+    }
+
+    fn squeezed(src: &[&str], widths: Vec<u16>, row: usize, revealed: bool) -> Vec<VRow> {
+        let lines: Vec<Vec<char>> = src.iter().map(|s| ch(s)).collect();
+        let role = match row {
+            0 => Role::Header,
+            1 => Role::Separator,
+            _ => Role::Body,
+        };
+        let ctx = Ctx { widths, aligns: aligns(&lines[1]), role, top: false, bottom: false, divider: false };
+        layout_row(&lines[row], &ctx, revealed)
+    }
+
+    const WIDE: [&str; 3] = ["| Part | Notes |", "|---|---|", "| CPU | six cores and twelve threads in one socket |"];
+
+    #[test]
+    fn long_cells_wrap_inside_their_column() {
+        let rows = squeezed(&WIDE, vec![6, 18], 2, false);
+        assert_eq!(
+            rows.iter().map(text).collect::<Vec<_>>(),
+            [
+                "│ CPU  │ six cores and    │",
+                "│      │ twelve threads   │",
+                "│      │ in one socket    │",
+            ]
+        );
+        assert!(rows[2].last && !rows[0].last);
+
+        // The line being edited wraps too, and keeps the same outline.
+        let raw = squeezed(&WIDE, vec![6, 18], 2, true);
+        assert_eq!(raw[0].cells.iter().map(|c| c.text.as_str()).collect::<String>(), "│ CPU  │ six cores and    │");
+        assert!(raw.iter().all(|r| text(r).chars().count() == 27), "{:?}", raw.iter().map(text).collect::<Vec<_>>());
+        // A word longer than the column is cut rather than breaking the grid.
+        let cut = squeezed(&["| a |", "|---|", "| Supercalifragilistic |"], vec![10], 2, false);
+        assert_eq!(cut.iter().map(text).collect::<Vec<_>>(), ["│ Supercal │", "│ ifragili │", "│ stic     │"]);
+    }
+
+    #[test]
+    fn the_cursor_finds_its_line_inside_a_wrapped_cell() {
+        use crate::layout::locate;
+        let src = WIDE[2];
+        let rows = squeezed(&WIDE, vec![6, 18], 2, true);
+        let at = |word: &str| src.find(word).unwrap();
+
+        assert_eq!(locate(&rows, at("CPU")), 0);
+        assert_eq!(locate(&rows, at("six")), 0);
+        assert_eq!(locate(&rows, at("twelve")), 1);
+        assert_eq!(locate(&rows, at("socket")), 2);
+        assert_eq!(locate(&rows, src.len()), 2, "the end of the line is the end of the last cell");
+        // x positions line up with what is drawn: "│ CPU  │ " is 9 cells.
+        assert_eq!(rows[1].x_of(at("twelve")), 9);
+        // (the raw line is a character wider than the rendered one, so it breaks differently)
+        assert_eq!(rows[2].cells.iter().filter(|c| c.solid).map(|c| c.text.as_str()).collect::<String>().trim(), "one socket");
+        assert_eq!(rows[2].x_of(at("socket")), 9 + "one ".len() as u16);
+        // Clicking text lands on it; clicking the padding after a wrapped line stays on that line.
+        assert_eq!(rows[1].col_at(9, src.len()), at("twelve"));
+        let past_line_one = rows[0].col_at(25, src.len());
+        assert_eq!(locate(&rows, past_line_one), 0);
+        // Every character of the source is reachable and maps back to itself.
+        for col in 0..src.len() {
+            let row = &rows[locate(&rows, col)];
+            if row.cells.iter().any(|c| c.solid && c.col == col) {
+                assert_eq!(row.col_at(row.x_of(col), src.len()), col, "col {col}");
+            }
+        }
     }
 
     #[test]

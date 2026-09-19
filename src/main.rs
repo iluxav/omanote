@@ -1,4 +1,5 @@
 mod clipboard;
+mod config;
 mod diacritics;
 mod editor;
 mod images;
@@ -19,7 +20,8 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::cursor::SetCursorStyle;
 use ratatui::crossterm::event::{
-    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event, KeyCode,
+    self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste, EnableFocusChange,
+    EnableMouseCapture, Event, KeyCode,
     KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind,
     PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
@@ -56,6 +58,8 @@ struct App {
     last_click: Option<(Instant, Pos)>,
     enhanced_keys: bool,
     image_mode: images::Mode,
+    /// Redraw every cell on the next frame, not just what changed.
+    repaint: bool,
     /// `--keys`: show and log every key event, for diagnosing terminal quirks.
     key_log: Option<std::fs::File>,
     quit: bool,
@@ -121,6 +125,14 @@ impl App {
         self.save_as = Some(SaveAs::new(&self.ed.lines, vaults::all(&vaults::home()), here, self.wanted.as_deref(), after));
     }
 
+    /// F2: move, rename or copy the note. One without a file yet just gets saved.
+    fn relocate(&mut self) {
+        let Some(path) = self.ed.path.clone() else { return self.ask_where(After::Stay) };
+        self.picker = None;
+        self.toast = None;
+        self.save_as = Some(SaveAs::relocate(&path, vaults::all(&vaults::home()), std::env::current_dir().ok()));
+    }
+
     fn carry_on(&mut self, after: After) {
         match after {
             After::Stay => {}
@@ -149,6 +161,7 @@ impl App {
                 'c' | 'g' => self.save_as = None,
                 'u' => prompt.edit(String::clear),
                 'w' | 'h' => prompt.edit(delete_word),
+                'k' if prompt.moving.is_some() => prompt.toggle_copy(),
                 // Only offered when the prompt interrupted quitting or switching notes.
                 'd' if !matches!(prompt.after, After::Stay) => {
                     let after = self.save_as.take().map(|p| p.after).unwrap_or(After::Stay);
@@ -175,19 +188,32 @@ impl App {
             return self.say(format!("{name} exists — Enter again to replace it, or rename"));
         }
         let vault = prompt.vaults[prompt.selected].path.clone();
-        self.ed.path = Some(path.clone());
-        match self.ed.save() {
-            Ok(_) => {
-                self.ed.images.set_note(&path, vault);
-                self.say(format!("Saved to {}", vaults::tilde(&path)));
-                let after = self.save_as.take().map(|p| p.after).unwrap_or(After::Stay);
-                self.carry_on(after);
-            }
-            Err(e) => {
-                self.ed.path = None;
-                self.say(format!("Could not save there: {e}"));
-            }
+        let (from, keep) = (prompt.moving.clone(), prompt.keep_original);
+        if from.as_ref() == Some(&path) {
+            return self.say("That is where it already is — change the name or pick another place");
         }
+        let before = self.ed.path.replace(path.clone());
+        if let Err(e) = self.ed.save() {
+            self.ed.path = before;
+            return self.say(format!("Could not save there: {e}"));
+        }
+        self.ed.images.set_note(&path, vault);
+        let mut done = format!("Saved to {}", vaults::tilde(&path));
+        if let Some(old) = from {
+            done = format!("Copied to {} — now editing the copy", vaults::tilde(&path));
+            if !keep {
+                // The new file is safely written; only now does the old one go.
+                match std::fs::remove_file(&old) {
+                    Ok(()) => done = format!("Moved to {}", vaults::tilde(&path)),
+                    Err(e) => done = format!("Saved to {}, but could not remove the original: {e}", vaults::tilde(&path)),
+                }
+            }
+            // If it left a GitHub vault, that vault has a deletion to send.
+            self.sync.saved(&old, &vaults::all(&vaults::home()));
+        }
+        self.say(done);
+        let after = self.save_as.take().map(|p| p.after).unwrap_or(After::Stay);
+        self.carry_on(after);
     }
 
     /// Switch to another note, saving the current one first.
@@ -292,6 +318,7 @@ impl App {
                     self.sync.pull_all(&all);
                     self.picker = Some(Picker::open_with(&all, std::env::current_dir().ok().as_deref()));
                 }
+                's' if shift => self.relocate(),
                 's' => self.save(),
                 'z' if shift => self.redo(),
                 'z' => {
@@ -301,6 +328,7 @@ impl App {
                 }
                 'y' => self.redo(),
                 'a' => ed.select_all(),
+                'l' => self.repaint = true,
                 'c' => {
                     clipboard::copy(&ed.copy());
                     self.say("Copied");
@@ -354,6 +382,7 @@ impl App {
             KeyCode::Enter => ed.enter(),
             KeyCode::Tab => ed.tab(),
             KeyCode::BackTab => ed.backtab(),
+            KeyCode::F(2) => self.relocate(),
             KeyCode::Esc => ed.clear_selection(),
             _ => {}
         }
@@ -420,7 +449,14 @@ impl App {
         match ev {
             Event::Key(key) => self.key(key),
             Event::Mouse(m) => self.mouse(m),
-            Event::Resize(..) => self.ed.images.set_cell(cell_pixels()),
+            // A terminal may shuffle what is on screen while it is resized or out of
+            // sight, and a resize that ends at the old size is invisible to the
+            // renderer. Painting everything afresh costs nothing and cannot be wrong.
+            Event::Resize(..) => {
+                self.ed.images.set_cell(cell_pixels());
+                self.repaint = true;
+            }
+            Event::FocusGained => self.repaint = true,
             Event::Paste(text) => match (&mut self.save_as, &mut self.picker) {
                 (Some(prompt), _) => prompt.edit(|n| n.extend(text.chars().filter(|c| !c.is_control()))),
                 (None, Some(p)) => p.push(&text),
@@ -445,7 +481,7 @@ fn restore_terminal(enhanced_keys: bool) {
     if enhanced_keys {
         let _ = execute!(out, PopKeyboardEnhancementFlags);
     }
-    let _ = execute!(out, DisableBracketedPaste, DisableMouseCapture, SetCursorStyle::DefaultUserShape, LeaveAlternateScreen);
+    let _ = execute!(out, DisableFocusChange, DisableBracketedPaste, DisableMouseCapture, SetCursorStyle::DefaultUserShape, LeaveAlternateScreen);
     let _ = disable_raw_mode();
 }
 
@@ -478,6 +514,7 @@ omanote — a small markdown note editor
   omanote <path/to/file.md>   open (or start) that file
   omanote --demo              a note that shows off what the editor renders
   Ctrl+P inside the editor    fuzzy-find a note in any vault
+  F2 inside the editor        move, rename or copy the note (another vault, another folder)
 
 Vaults (where Ctrl+P looks; new notes go in ~/.omanote/docs):
   omanote --vl <folder>       add a folder of notes
@@ -485,6 +522,10 @@ Vaults (where Ctrl+P looks; new notes go in ~/.omanote/docs):
   omanote --vlrm <name>       forget a vault (folder, owner/repo or name); files are kept
   omanote --vls               list vaults
   omanote --sync              sync every GitHub vault now: pull, then push
+
+  omanote --config            where the settings file is (creates it), and what it says:
+                              text width, left/center/right, margins
+  Ctrl+L inside the editor    repaint the screen
 
   --keys                      show every key event (for diagnosing a terminal)
   -h, --help                  this text
@@ -526,6 +567,16 @@ fn cli(args: &[String]) -> Result<(Target, bool, bool), String> {
             "--vlgh" => vaults::add_github(&home, &value("a GitHub repo, like owner/repo")?)?,
             "--vlrm" => vaults::remove(&home, &value("the vault to remove")?)?,
             "--vls" => vaults::list(&home),
+            "--config" => {
+                let file = config::ensure(&home).map_err(|e| format!("cannot write the config: {e}"))?;
+                let (now, problems) = config::load(&home);
+                let align = format!("{:?}", now.align).to_lowercase();
+                let mut out = format!("{}\n\n  width = {}\n  align = \"{align}\"\n  margin = {}\n", vaults::tilde(&file), now.width, now.margin);
+                for problem in problems {
+                    out.push_str(&format!("\n  ! {problem}"));
+                }
+                out
+            }
             "--sync" => {
                 let ok = sync::sync_all(&home, &vaults::all(&home));
                 std::process::exit(if ok { 0 } else { 1 });
@@ -612,7 +663,7 @@ fn main() -> std::io::Result<()> {
     enable_raw_mode()?;
     let enhanced_keys = supports_keyboard_enhancement().unwrap_or(false);
     let mut out = stdout();
-    execute!(out, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste, SetCursorStyle::SteadyBar)?;
+    execute!(out, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste, EnableFocusChange, SetCursorStyle::SteadyBar)?;
     if enhanced_keys {
         execute!(out, PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES))?;
     }
@@ -634,6 +685,7 @@ fn main() -> std::io::Result<()> {
         last_click: None,
         enhanced_keys,
         image_mode: images::detect(),
+        repaint: false,
         key_log,
         quit: false,
     };
@@ -646,6 +698,10 @@ fn main() -> std::io::Result<()> {
     }
 
     let all_vaults = vaults::all(&vaults::home());
+    let (settings, problems) = config::load(&vaults::home());
+    if let Some(first) = problems.first() {
+        app.say(format!("config.toml, {first}"));
+    }
     let result = (|| -> std::io::Result<()> {
         while !app.quit {
             if app.toast.as_ref().is_some_and(|(_, at)| at.elapsed() > TOAST) {
@@ -656,7 +712,11 @@ fn main() -> std::io::Result<()> {
             let syncing = app.ed.path.as_ref().and_then(|p| app.sync.state(p, &all_vaults));
             // Images have to be in the terminal before the frame that refers to them.
             let size = terminal.size()?;
-            if let Some((x, y, w, h)) = ui::text_area(ratatui::layout::Rect::new(0, 0, size.width, size.height)) {
+            if std::mem::take(&mut app.repaint) {
+                terminal.clear()?;
+            }
+            if let Some((x, y, w, h, table_w)) = ui::text_area(ratatui::layout::Rect::new(0, 0, size.width, size.height), &settings) {
+                app.ed.table_w = table_w;
                 app.ed.set_view(x, y, w, h);
                 let pending = app.ed.images.take_outbox();
                 if !pending.is_empty() {
@@ -665,7 +725,7 @@ fn main() -> std::io::Result<()> {
                     out.flush()?;
                 }
             }
-            terminal.draw(|f| ui::draw(f, &mut app.ed, app.picker.as_ref(), app.save_as.as_ref(), toast.as_deref(), syncing, app.enhanced_keys))?;
+            terminal.draw(|f| ui::draw(f, &mut app.ed, app.picker.as_ref(), app.save_as.as_ref(), toast.as_deref(), syncing, &settings, app.enhanced_keys))?;
 
             if event::poll(Duration::from_millis(250))? {
                 // Drain everything pending so a burst of input costs one redraw.

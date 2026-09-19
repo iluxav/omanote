@@ -1,5 +1,7 @@
-//! The "where do I save this?" prompt for a note that has no file yet:
-//! a file name, prefilled from the first line, and a choice of vault.
+//! The "where does this go?" prompt: a file name and a choice of vault.
+//!
+//! For a note that has no file yet the name is prefilled from its first line.
+//! For one that has (F2), the same prompt moves, renames or copies it.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -20,6 +22,13 @@ pub struct SaveAs {
     pub selected: usize,
     /// Which entry of `vaults` is really the folder omanote was started in.
     pub here: Option<usize>,
+    /// Moving an existing note: its file, and which entry is the folder it is in now.
+    pub moving: Option<PathBuf>,
+    pub stays: Option<usize>,
+    /// Copy instead of move: the original file is left where it is.
+    pub keep_original: bool,
+    /// Extension the file gets. A moved note keeps its own.
+    pub ext: String,
     pub after: After,
     /// Set after a first Enter on a name that already exists; a second Enter replaces it.
     pub confirm_replace: bool,
@@ -58,7 +67,32 @@ impl SaveAs {
             here_at = Some(vaults.len());
             vaults.push(Vault { path: here, github: None });
         }
-        SaveAs { name, vaults, selected: 0, here: here_at, after, confirm_replace: false }
+        SaveAs { name, vaults, selected: 0, here: here_at, moving: None, stays: None, keep_original: false, ext: "md".into(), after, confirm_replace: false }
+    }
+
+    /// Move, rename or copy a note that already has a file. Offers every vault,
+    /// the current folder and the folder the note is in; starts on the first
+    /// place that is not where it already is.
+    pub fn relocate(current: &Path, vaults: Vec<Vault>, here: Option<PathBuf>) -> Self {
+        let mut prompt = SaveAs::new(&[], vaults, here, None, After::Stay);
+        prompt.name = current.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+        let ext = current.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+        if ["markdown", "txt"].contains(&ext.as_str()) {
+            prompt.ext = ext;
+        }
+        let folder = current.parent().map(Path::to_path_buf).filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| PathBuf::from("."));
+        prompt.stays = prompt.vaults.iter().position(|v| v.path == folder).or_else(|| {
+            prompt.vaults.push(Vault { path: folder, github: None });
+            Some(prompt.vaults.len() - 1)
+        });
+        prompt.selected = (0..prompt.vaults.len()).find(|i| Some(*i) != prompt.stays).unwrap_or(0);
+        prompt.moving = Some(current.to_path_buf());
+        prompt
+    }
+
+    pub fn toggle_copy(&mut self) {
+        self.keep_original = !self.keep_original;
+        self.confirm_replace = false;
     }
 
     pub fn edit(&mut self, change: impl FnOnce(&mut String)) {
@@ -76,7 +110,7 @@ impl SaveAs {
     /// but can never leave the vault.
     pub fn target(&self) -> Result<PathBuf, String> {
         let name = self.name.trim();
-        let name = name.strip_suffix(".md").unwrap_or(name).trim().trim_matches('/');
+        let name = name.strip_suffix(&format!(".{}", self.ext)).unwrap_or(name).trim().trim_matches('/');
         if name.is_empty() {
             return Err("Type a name for the note".into());
         }
@@ -85,7 +119,7 @@ impl SaveAs {
             return Err("The name cannot contain ..".into());
         }
         let vault = self.vaults.get(self.selected).ok_or("No vault to save in")?;
-        Ok(vault.path.join(format!("{name}.md")))
+        Ok(vault.path.join(format!("{name}.{}", self.ext)))
     }
 }
 
@@ -143,6 +177,34 @@ mod tests {
         assert_eq!(p.target(), Ok("/home/me/project/real-title.md".into()));
         // Started inside a vault: not offered twice.
         assert_eq!(SaveAs::new(&lines("x"), vaults(), Some("/v/work".into()), None, After::Stay).here, None);
+    }
+
+    #[test]
+    fn relocating_offers_everywhere_and_starts_away_from_where_it_is() {
+        // A loose file outside every vault, as in ~/Work/report.md.
+        let p = SaveAs::relocate(Path::new("/home/me/Work/report-2026.md"), vaults(), Some("/home/me".into()));
+        assert_eq!((p.name.as_str(), p.ext.as_str()), ("report-2026", "md"));
+        let places: Vec<_> = p.vaults.iter().map(|v| v.path.to_string_lossy().into_owned()).collect();
+        assert_eq!(places, ["/v/docs", "/v/work", "/home/me", "/home/me/Work"]);
+        assert_eq!((p.here, p.stays, p.selected), (Some(2), Some(3), 0));
+        assert_eq!(p.target(), Ok("/v/docs/report-2026.md".into()));
+
+        // A note already in the default vault: that entry is "where it is", so start on the next.
+        let mut p = SaveAs::relocate(Path::new("/v/docs/idea.md"), vaults(), None);
+        assert_eq!((p.vaults.len(), p.stays, p.selected), (2, Some(0), 1));
+        assert_eq!(p.target(), Ok("/v/work/idea.md".into()));
+        // Same folder, new name: a rename.
+        p.step(-1);
+        p.edit(|n| *n = "better idea".into());
+        assert_eq!(p.target(), Ok("/v/docs/better idea.md".into()));
+
+        // Other text files keep their extension.
+        let p = SaveAs::relocate(Path::new("/tmp/LOG.TXT"), vaults(), None);
+        assert_eq!(p.target(), Ok("/v/docs/LOG.txt".into()));
+        let mut p = SaveAs::relocate(Path::new("/tmp/x.md"), vaults(), None);
+        p.confirm_replace = true;
+        p.toggle_copy();
+        assert!(p.keep_original && !p.confirm_replace);
     }
 
     #[test]

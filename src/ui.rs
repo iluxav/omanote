@@ -6,22 +6,31 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 
+use crate::config::{Align, Config};
 use crate::editor::{Editor, Pos};
 use crate::layout::{VRow, locate};
 use crate::picker::{Picker, Row, age};
 use crate::saveas::{After, SaveAs};
 use crate::vaults::tilde;
 
-const MAX_WIDTH: u16 = 84;
 const PICKER_ROWS: usize = 8;
 
-/// Where the text column goes: (x, y, width, height). `None` if the terminal is too small.
-pub fn text_area(area: Rect) -> Option<(u16, u16, u16, u16)> {
+/// Where the text column goes: (x, y, width, height), and how wide a table
+/// may get (it can spill past the column into free window on its right).
+/// `None` if the terminal is too small.
+pub fn text_area(area: Rect, config: &Config) -> Option<(u16, u16, u16, u16, u16)> {
     if area.height < 5 || area.width < 24 {
         return None;
     }
-    let w = (area.width - 4).min(MAX_WIDTH);
-    Some(((area.width - w) / 2, 1, w, area.height - 3))
+    let margin = config.margin.min(area.width / 4);
+    let room = area.width - 2 * margin;
+    let w = if config.width == 0 { room } else { config.width.clamp(20, room.max(20)).min(room) };
+    let x = match config.align {
+        Align::Left => margin,
+        Align::Center => (area.width - w) / 2,
+        Align::Right => area.width - margin - w,
+    };
+    Some((x, 1, w, area.height - 3, area.width - margin - x))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -32,10 +41,12 @@ pub fn draw(
     save_as: Option<&SaveAs>,
     toast: Option<&str>,
     sync: Option<&str>,
+    config: &Config,
     enhanced_keys: bool,
 ) {
     let area = f.area();
-    let Some((x, _, w, h)) = text_area(area) else { return };
+    let Some((x, _, w, h, table_w)) = text_area(area, config) else { return };
+    ed.table_w = table_w;
     ed.set_view(x, 1, w, h);
 
     let sel = ed.selection();
@@ -73,6 +84,8 @@ pub fn draw(
 
     draw_status(f, ed, toast, sync, Rect::new(x, area.height - 2, w, 1));
     let hints = match (save_as, picker) {
+        (Some(p), _) if p.moving.is_some() && p.keep_original => Some(vec![("Enter", "Copy"), ("^K", "Move instead"), ("↑↓", "Where"), ("Esc", "Cancel")]),
+        (Some(p), _) if p.moving.is_some() => Some(vec![("Enter", "Move"), ("^K", "Copy instead"), ("↑↓", "Where"), ("Esc", "Cancel")]),
         (Some(p), _) if matches!(p.after, After::Stay) => Some(vec![("Enter", "Save"), ("↑↓", "Vault"), ("Esc", "Cancel")]),
         (Some(_), _) => Some(vec![("Enter", "Save"), ("↑↓", "Vault"), ("^D", "Discard"), ("Esc", "Cancel")]),
         (None, Some(_)) => Some(vec![("↑↓", "Select"), ("Enter", "Open"), ("Esc", "Cancel"), ("^U", "Clear")]),
@@ -95,6 +108,8 @@ fn draw_save_as(f: &mut Frame, p: &SaveAs, toast: Option<&str>, x: u16, w: u16, 
     f.render_widget(Clear, Rect::new(0, area.y, f.area().width, h));
 
     let title = match p.after {
+        After::Stay if p.moving.is_some() && p.keep_original => "── Copy note · the original stays ",
+        After::Stay if p.moving.is_some() => "── Move note ",
         After::Stay => "── Save note ",
         After::Quit => "── Save before quitting? ",
         After::Open(_) => "── Save this note first? ",
@@ -102,10 +117,10 @@ fn draw_save_as(f: &mut Frame, p: &SaveAs, toast: Option<&str>, x: u16, w: u16, 
     let label = "  Name › ";
     let mut lines = vec![
         Line::styled(format!("{title}{}", "─".repeat((w as usize).saturating_sub(title.chars().count()))), dim),
-        Line::from(vec![Span::styled(label, Style::new().fg(Color::Magenta)), Span::raw(p.name.clone()), Span::styled(".md", dim)]),
+        Line::from(vec![Span::styled(label, Style::new().fg(Color::Magenta)), Span::raw(p.name.clone()), Span::styled(format!(".{}", p.ext), dim)]),
         match toast {
             Some(msg) => Line::styled(format!("  {msg}"), Style::new().fg(Color::Yellow)),
-            None => Line::styled("  Vault", dim),
+            None => Line::styled(if p.moving.is_some() { "  To" } else { "  Vault" }, dim),
         },
     ];
     let first = p.selected.saturating_sub(shown - 1);
@@ -113,6 +128,7 @@ fn draw_save_as(f: &mut Frame, p: &SaveAs, toast: Option<&str>, x: u16, w: u16, 
         let selected = i == p.selected;
         let pick = |style: Style| if selected { style.add_modifier(Modifier::REVERSED) } else { style };
         let kind = match (&vault.github, i) {
+            _ if p.stays == Some(i) => "where it is now".to_string(),
             _ if p.here == Some(i) => "current folder".to_string(),
             (Some(repo), _) => format!("github: {repo}"),
             (None, 0) => "default".to_string(),
@@ -262,6 +278,7 @@ fn draw_hints(f: &mut Frame, modal: Option<Vec<(&'static str, &'static str)>>, e
         hints.push(("^I", "Italic"));
     }
     hints.push(("^T", "Task"));
+    hints.insert(3, ("F2", "Move"));
     if let Some(modal) = modal {
         hints = modal;
     }
