@@ -88,6 +88,10 @@ chmod 755 "$tmp/omanote"
 mv -f "$tmp/omanote" "$DIR/omanote"
 
 say "Installed $DIR/omanote"
+# On a desktop, offer the launcher entry. Never automatic: it writes outside $DIR.
+if [ -n "${XDG_CURRENT_DESKTOP:-}${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]; then
+    say "Add it to your app launcher (and the Omarchy menu) with:  omanote --omarchy"
+fi
 case ":$PATH:" in
     *":$DIR:"*) say "Run it from anywhere:  omanote --help" ;;
     *)

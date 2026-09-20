@@ -225,6 +225,47 @@ impl Picker {
     }
 }
 
+fn json_string(text: &str) -> String {
+    let mut out = String::from("\"");
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// `omanote --find <query>`: the ranked matches as JSON, for the desktop
+/// search popup. The same search and the same order as Ctrl+P, so the two
+/// never disagree. `name` is the note inside its vault, `where` the vault.
+pub fn find_json(vaults: &[Vault], query: &str, limit: usize) -> String {
+    let mut picker = Picker::open(vaults);
+    picker.push(query);
+    let mut rows = Vec::new();
+    for hit in picker.hits.iter().take(limit) {
+        let note = &picker.notes[hit.note];
+        let vault = vaults.iter().filter(|v| note.path.starts_with(&v.path)).max_by_key(|v| v.path.as_os_str().len());
+        let (name, place) = match vault {
+            Some(v) => (note.path.strip_prefix(&v.path).unwrap_or(&note.path).with_extension(""), tilde(&v.path)),
+            None => (note.path.with_extension(""), String::new()),
+        };
+        rows.push(format!(
+            "{{\"path\":{},\"name\":{},\"where\":{},\"age\":{}}}",
+            json_string(&note.path.to_string_lossy()),
+            json_string(&name.to_string_lossy()),
+            json_string(&place),
+            json_string(&age(note.modified))
+        ));
+    }
+    format!("[{}]", rows.join(","))
+}
+
 const MATCH: i32 = 1;
 const CONSECUTIVE: i32 = 6;
 const BOUNDARY: i32 = 8;
@@ -431,6 +472,26 @@ mod tests {
 
         // Started from inside a vault, its notes are not listed twice.
         assert_eq!(Picker::open_with(&vaults, Some(&root.join("docs/work"))).total(), 4);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn find_gives_the_popup_ranked_json() {
+        let root = temp_vault(&["docs/welcome.md", "docs/work/to \"do\".md", "team/welcome-back.md"]);
+        let vaults = [Vault { path: root.join("docs"), github: None }, Vault { path: root.join("team"), github: Some("me/team".into()) }];
+        let all = find_json(&vaults, "", 50);
+        assert_eq!(all.matches("\"path\"").count(), 3, "{all}");
+
+        let hits = find_json(&vaults, "welc", 50);
+        assert!(hits.starts_with("[{") && hits.ends_with("}]"));
+        assert!(hits.contains("\"name\":\"welcome\"") && hits.contains("\"name\":\"welcome-back\""), "{hits}");
+        assert!(hits.contains(&format!("\"where\":{}", json_string(&tilde(&root.join("team"))))), "the vault, for the dimmed column");
+        assert!(!hits.contains("to \\\"do"), "only what matches");
+
+        // Quotes in a file name stay valid JSON; nothing matching is an empty list.
+        assert!(find_json(&vaults, "to do", 50).contains("work/to \\\"do\\\""));
+        assert_eq!(find_json(&vaults, "zzzz", 50), "[]");
+        assert_eq!(find_json(&vaults, "", 1).matches("\"path\"").count(), 1);
         let _ = std::fs::remove_dir_all(root);
     }
 

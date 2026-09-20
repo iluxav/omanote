@@ -2,6 +2,9 @@
 name = "omanote"
 version = "0.0.8"
 edition = "2024"
+description = "An Obsidian-style markdown note editor for the terminal"
+license = "MIT"
+repository = "https://github.com/iluxav/omanote"
 
 [dependencies]
 ratatui = "0.29"

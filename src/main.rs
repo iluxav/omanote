@@ -1,5 +1,7 @@
+mod capture;
 mod clipboard;
 mod config;
+mod desktop;
 mod diacritics;
 mod editor;
 mod images;
@@ -579,6 +581,12 @@ Vaults (where Ctrl+P looks; new notes go in ~/.omanote/docs):
   omanote --vls               list vaults
   omanote --sync              sync every GitHub vault now: pull, then push
 
+Desktop:
+  omanote --new [name]        a new note, even if one by that name exists
+  omanote --find [words]      matching notes as JSON (what the Omarchy search popup asks)
+  omanote --capture <text>    add a line to the inbox note without opening the editor
+  omanote --omarchy           add omanote to the app launcher and the Omarchy menu
+
   omanote --config            edit the settings (text width, left/center/right, margins);
                               saving applies them straight away
   Ctrl+L inside the editor    repaint the screen
@@ -591,6 +599,8 @@ Vaults (where Ctrl+P looks; new notes go in ~/.omanote/docs):
 #[derive(Debug, PartialEq, Eq)]
 enum Target {
     Untitled,
+    /// `--new`: an empty note, with a name to suggest when it is saved.
+    New(String),
     File(PathBuf),
     /// A name to look for in the current folder and the vaults.
     Find(String),
@@ -623,6 +633,22 @@ fn cli(args: &[String]) -> Result<(Target, bool, bool), String> {
             "--vlgh" => vaults::add_github(&home, &value("a GitHub repo, like owner/repo")?)?,
             "--vlrm" => vaults::remove(&home, &value("the vault to remove")?)?,
             "--vls" => vaults::list(&home),
+            "--omarchy" => desktop::integrate(),
+            "--find" => {
+                let query: Vec<String> = it.by_ref().cloned().collect();
+                picker::find_json(&vaults::all(&home), &query.join(" "), 60)
+            }
+            "--new" => {
+                // A new note no matter what exists; the words become its suggested name.
+                let name: Vec<String> = it.by_ref().cloned().collect();
+                return Ok((Target::New(name.join(" ")), keys, demo));
+            }
+            "--capture" => {
+                // Everything after the flag is the note, quoted or not.
+                let text: Vec<String> = it.by_ref().cloned().collect();
+                let vault = vaults::all(&home).first().map(|v| v.path.clone()).unwrap_or_default();
+                capture::capture(&vault, &text.join(" "))?
+            }
             "--config" => {
                 // Open the settings in the editor itself; saving applies them.
                 let file = config::ensure(&home).map_err(|e| format!("cannot write the config: {e}"))?;
@@ -672,6 +698,10 @@ fn main() -> std::io::Result<()> {
     let mut greeting = None;
     let path = match target {
         Target::Untitled => None,
+        Target::New(name) => {
+            wanted = Some(name).filter(|n| !n.trim().is_empty());
+            None
+        }
         Target::File(path) => Some(path),
         Target::Find(name) => {
             let all = vaults::all(&vaults::home());

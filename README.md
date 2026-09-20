@@ -1,4 +1,4 @@
- <img src="assets/icon.svg" width="96" align="right" alt="omanote icon">
+ <img src="assets/icon-256.png" width="96" align="right" alt="omanote icon">
 
 # omanote
 
@@ -90,6 +90,22 @@ Paste a screenshot with `Ctrl+V` and it is embedded in the note itself, so the f
 
 Real images need a terminal with the Kitty graphics protocol (Ghostty, Kitty). Other terminals get a low-resolution preview made of coloured blocks. Remote images are downloaded in the background and cached; set `OMANOTE_REMOTE_IMAGES=off` to never fetch them.
 
+## On Omarchy
+
+```sh
+omanote --omarchy
+```
+
+adds omanote to the app launcher (through `omarchy-tui-install`) and a Notes section to the Omarchy menu. It prints what it does, changes nothing that is already there, and is safe to run twice. On other desktops it writes a plain `.desktop` entry.
+
+For a notes icon in the bar and a quick-capture box, there is a plugin:
+
+```sh
+omarchy plugin add https://github.com/iluxav/omarchy-omanote --enable
+```
+
+`omanote --capture "call the dentist"` is what quick capture runs: it appends a line to `inbox.md` in your default vault, under a heading for the day, without opening the editor.
+
 ## Settings
 
 `omanote --config` opens the settings file (`~/.omanote/config.toml`) in omanote itself, creating it with comments the first time:
@@ -139,3 +155,7 @@ make release    # tag the version in Cargo.toml and push the tag
 ```
 
 Pushing a `v*` tag makes GitHub Actions build the binaries and publish the release that `install.sh` downloads.
+
+## License
+
+[MIT](LICENSE)
