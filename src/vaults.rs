@@ -113,6 +113,20 @@ fn register(home: &Path, vault: Vault) -> Result<bool, String> {
 
 // ---- commands ------------------------------------------------------------
 
+/// Where a note is, for showing beside its name: the vault and the folder
+/// inside it (`md-notes/trips/`), or for a file outside every vault its folder
+/// (`~/Work/`). Ends in a slash, so the file name can follow directly.
+pub fn place(note: &Path, vaults: &[Vault]) -> String {
+    let note = std::path::absolute(note).unwrap_or_else(|_| note.to_path_buf());
+    let Some(folder) = note.parent() else { return String::new() };
+    let vault = vaults.iter().filter(|v| folder.starts_with(&v.path)).max_by_key(|v| v.path.as_os_str().len());
+    let shown = match vault {
+        Some(v) => Path::new(&v.name()).join(folder.strip_prefix(&v.path).unwrap_or(Path::new(""))).display().to_string(),
+        None => tilde(folder),
+    };
+    format!("{}/", shown.trim_end_matches('/'))
+}
+
 pub fn tilde(path: &Path) -> String {
     let home = std::env::var("HOME").unwrap_or_default();
     match path.strip_prefix(&home) {
@@ -314,4 +328,17 @@ mod tests {
         assert_eq!(root_of(Some(Path::new("/elsewhere/a.md")), &vaults), PathBuf::from("/v/docs"));
         assert_eq!(root_of(None, &vaults), PathBuf::from("/v/docs"));
     }
+    #[test]
+    fn says_where_a_note_is() {
+        let vaults = vec![Vault { path: "/v/docs".into(), github: None }, Vault { path: "/v/docs/clients/acme".into(), github: None }];
+        assert_eq!(place(Path::new("/v/docs/today.md"), &vaults), "docs/");
+        assert_eq!(place(Path::new("/v/docs/trips/asia/japan.md"), &vaults), "docs/trips/asia/");
+        assert_eq!(place(Path::new("/v/docs/clients/acme/q3/plan.md"), &vaults), "acme/q3/", "the innermost vault is the one it is in");
+        assert_eq!(place(Path::new("/srv/files/log.txt"), &vaults), "/srv/files/");
+        let home = std::env::var("HOME").unwrap_or_default();
+        if !home.is_empty() {
+            assert_eq!(place(&Path::new(&home).join("Work/report.md"), &vaults), "~/Work/");
+        }
+    }
+
 }

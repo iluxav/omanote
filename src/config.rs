@@ -49,8 +49,11 @@ margin = 2
 # Add your own to the menu, or redefine a known one:
 #   {context}  what you are doing: the note, the cursor line, any selected text
 #   {file}     the note          {dir}  the folder the agent starts in
+#   {now}      a file omanote keeps up to date with the note you are in, as you move
+#              between notes ({context} tells the agent to read it); {nowdir} is its
+#              folder, for agents that must be allowed to read outside their own
 # agent.Work bot = "workbot --chat {context}"
-# agent.claude = "claude --model opus --append-system-prompt {context}"
+# agent.claude = "claude --model opus --add-dir {nowdir} --append-system-prompt {context}"
 #
 # To skip the menu, name the one you always want (or give a full command):
 # assistant = "codex"

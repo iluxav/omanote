@@ -98,7 +98,20 @@ pub struct Images {
     fetched: (Sender<Fetched>, Receiver<Fetched>),
 }
 
+/// Where the ids of a second note's images start. Two notes side by side
+/// each number their own pictures, and the terminal keeps one picture per id.
+const HIGH_IDS: u32 = 0x80_0000;
+
 impl Images {
+    pub fn with_high_ids(mut self) -> Self {
+        self.next_id = HIGH_IDS;
+        self
+    }
+
+    pub fn high_ids(&self) -> bool {
+        self.next_id >= HIGH_IDS
+    }
+
     pub fn new(mode: Mode, cell: (u16, u16), note: Option<&Path>, vault: PathBuf) -> Self {
         let note_dir = note.and_then(Path::parent).map(Path::to_path_buf).filter(|d| !d.as_os_str().is_empty());
         let mut images = Images {

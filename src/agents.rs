@@ -10,7 +10,7 @@ use std::process::{Command, Stdio};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Agent {
     pub name: String,
-    /// What to run. `{context}`, `{file}` and `{dir}` are filled in.
+    /// What to run. `{context}`, `{file}`, `{dir}`, `{now}` and `{nowdir}` are filled in.
     pub command: String,
 }
 
@@ -19,10 +19,12 @@ pub struct Agent {
 /// way. Only Claude Code can take it silently, as an addition to its system
 /// prompt; for the others it is their first message. The rest are started
 /// plain, in the right folder, because their flags are not something to guess.
+/// `{nowdir}` is let into the workspace of the agents that fence theirs, so
+/// reading the "where is the user now" file never needs a permission prompt.
 const KNOWN: [(&str, &str, &str); 11] = [
-    ("Claude Code", "claude", "claude --append-system-prompt {context}"),
+    ("Claude Code", "claude", "claude --add-dir {nowdir} --append-system-prompt {context}"),
     ("Codex", "codex", "codex {context}"),
-    ("Gemini", "gemini", "gemini -i {context}"),
+    ("Gemini", "gemini", "gemini --include-directories {nowdir} -i {context}"),
     ("opencode", "opencode", "opencode --prompt {context}"),
     ("Qwen Code", "qwen", "qwen -i {context}"),
     ("Aider", "aider", "aider {file}"),
@@ -129,7 +131,7 @@ mod tests {
         let agents = pick(&custom, &found(&["codex", "workbot", "claude"]));
         let names: Vec<&str> = agents.iter().map(|a| a.name.as_str()).collect();
         assert_eq!(names, ["Work bot", "Claude Code", "Codex"], "yours, then the known ones in a fixed order; missing programs are left out");
-        assert_eq!(agents[1].command, "claude --append-system-prompt {context}");
+        assert_eq!(agents[1].command, "claude --add-dir {nowdir} --append-system-prompt {context}");
         assert!(pick(&[], &found(&[])).is_empty());
     }
 
@@ -147,7 +149,7 @@ mod tests {
         let agents = pick(&[], &found(&["claude", "codex"]));
         assert_eq!(named("codex", &agents).command, "codex {context}");
         assert_eq!(named("Claude Code", &agents).name, "Claude Code");
-        assert_eq!(named("GEMINI", &agents).command, "gemini -i {context}", "a known agent, even if detection missed it");
+        assert_eq!(named("GEMINI", &agents).command, "gemini --include-directories {nowdir} -i {context}", "a known agent, even if detection missed it");
         let custom = named("/opt/bin/mybot --talk {context}", &agents);
         assert_eq!((custom.name.as_str(), custom.command.as_str()), ("mybot", "/opt/bin/mybot --talk {context}"));
     }

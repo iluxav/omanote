@@ -6,7 +6,7 @@ A small markdown note editor for the terminal. Think *nano for markdown*: open i
 
 Markdown renders as you write. Headings, **bold**, links, checkboxes, tables and images show formatted, and the raw syntax only appears on the line you are editing.
 
-![omanote editing a note: a heading, an image, a task list and a table, all rendered in the terminal](assets/screenshot.png)
+![omanote editing a note in the terminal: a list, a table and an image rendered in place, with the menu of AI agents that can open beside it](assets/screenshot.png)
 
 ## Install
 
@@ -56,6 +56,12 @@ Write first, name it later: on a new note `Ctrl+S` asks where to keep it (a vaul
 | `Ctrl+P` | find a note by fuzzy search, or create one |
 | `Ctrl+S` / `Ctrl+Q` | save / quit |
 | `F2` | move, rename or copy the note: another vault, another folder, another name |
+| `@` | link another note: suggestions as you type, or create one |
+| `Ctrl+K` | make the selected text a link |
+| `Ctrl+O` | open the link under the cursor |
+| `Alt+O` | open the link beside this note, on the right |
+| `F6` | with two notes open: move to the other one (`Ctrl+Q` closes the one you are in) |
+| `Alt+←` / `Alt+→` | back to the note you came from / forward again |
 | `Ctrl+G` | an AI agent of your choice in a pane beside the note |
 | `Ctrl+Z` / `Ctrl+Y` | undo / redo |
 | `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | copy / cut / paste |
@@ -67,27 +73,55 @@ Write first, name it later: on a new note `Ctrl+S` asks where to keep it (a vaul
 
 The mouse works too: click, drag to select, double-click a word, scroll, click a checkbox.
 
+### Linking notes
+
+Type `@` and start typing a name. A list of matching notes from your vaults opens under the cursor and narrows as you type; its last entry is always **Create “name.md”**, for a note that does not exist yet. `↑` `↓` choose, `Enter` turns the `@name` into a link, `Esc` (or just carrying on with your sentence) closes the list. An `@` in the middle of a word, such as an e-mail address, does nothing.
+
+The link is ordinary markdown with a relative path, `[trip plan](trips/trip%20plan.md)`, so it also works on GitHub and in any other markdown tool. A created note starts with its name as a heading, in the same folder as the note you are writing.
+
+`Ctrl+O` opens the link under the cursor (so do `Ctrl+Enter` and `Ctrl+click`): a note opens in place; a web address, picture or PDF opens with your desktop's default program. `[[wiki links]]` are followed too, by name. If a linked note has been moved since, omanote finds it by name in your vaults; if it does not exist anywhere, following the link starts it.
+
+#### Links to the web, and links on your own words
+
+Copy a web address and paste it:
+
+- with text selected, the text becomes the link: `[the docs](https://…)`;
+- with nothing selected, you get a link under a short readable name, `[github.com/iluxav/omanote](https://…)`, so a long address does not sprawl across the note. One `Ctrl+Z` turns it back into the plain address, if that is what you wanted;
+- an address of a picture, pasted on an empty line, becomes `![](https://…)` and shows the picture.
+
+`Ctrl+K` makes the selected text a link without anything in the clipboard: you get `[your text]()` with the cursor between the brackets, ready for an address to be typed or pasted, or for `@` to pick one of your notes (there it fills in just the path). With an address already in the clipboard, `Ctrl+K` completes the link in one go. None of this happens in code blocks, in plain-text files, or inside the brackets of a link, where a pasted address stays an address. It makes no difference how you paste: `Ctrl+V`, your terminal's own paste (`Ctrl+Shift+V`, the middle button) and Omarchy's `Super+V` all do the same.
+
+#### Two notes side by side
+
+`Alt+O` on a link (or `Ctrl+Shift+O`, or `Alt+click`) opens the note on the right and leaves the one you are in on the left, so you can read one while writing the other. Both are real editors. `F6` or a click moves the keyboard across; the footer under each note shows which one has it. Links followed in the right-hand note open on the right, so the left one stays put as you wander; from the left, `Ctrl+O` still opens in place and `Alt+O` sends the link to the right. `Ctrl+Q` closes the side you are in, and the other note gets the window back. Each side has its own `Alt+←` history.
+
+A note is never open twice: following a link to the note that is already on the other side just takes you there. The note you leave is saved as you cross over, and either one reloads if it changes on disk. With the assistant open as well there are three columns when the window has room for them; when it does not, the note without the keyboard steps aside until you `F6` back to it. The assistant is told about both notes and which one you are in.
+
+omanote remembers the notes you pass through, like a browser: however you got to a note (a link, `Ctrl+P`, `Ctrl+N`), `Alt+←` goes back to the one before, with the cursor where you left it, and `Alt+→` goes forward again. While there is a way back, the status line shows it (`Alt+← today.md`), and clicking that does the same.
+
 ### An assistant beside the note
 
 `Ctrl+G` opens an AI agent in a pane on the right, inside omanote's own window: a real terminal running the agent's own CLI.
 
-- **No agent is built in.** omanote looks for the agent CLIs you have installed (Claude Code, Codex, Gemini, opencode, Qwen Code, Aider, Cursor Agent, GitHub Copilot, Crush, Amp, Goose) and asks which one: arrows and `Enter`, or its number. It starts on the one you used last. With a single agent installed there is nothing to ask.
+- **No agent is built in.** omanote looks for the agent CLIs you have installed (Claude Code, Codex, Gemini, opencode, Qwen Code, Aider, Cursor Agent, GitHub Copilot, Crush, Amp, Goose) and asks which one in a popup: arrows and `Enter`, or its number. It starts on the one you used last. With a single agent installed there is nothing to ask.
 - It starts in the note's vault, so it can see your other notes, and it is told which note you are in, the line your cursor is on, and any text you have selected. Claude Code takes that silently, as an addition to its system prompt, so nothing is sent until you type; Codex, Gemini, opencode and Qwen take it as their opening message; the others are simply started in the right folder.
+- **It follows you between notes.** An agent can only be briefed once, when it starts, so part of that briefing is where to look: omanote keeps a small file (`~/.omanote/now/<pid>.md`, also `$OMANOTE_NOW`) that always says which note is open, the line your cursor is on and what you have selected. Open another note, by a link or `Ctrl+P`, and "tidy up this note" still means the one in front of you. The file explains itself (re-read me before every request; edit the note's file, never this one), so an agent that starts without a briefing only needs to be told "read `$OMANOTE_NOW`". The pane's title shows the note the agent will find there. Claude Code and Gemini are started with that folder allowed, so reading it needs no permission prompt. The file is removed when the pane closes or omanote ends, including when its window is simply closed; one orphaned by a crash or `kill -9` is cleared out by the next omanote you start.
+- **It knows where your notes are.** The same file lists your vault folders, not the notes in them: the agent searches with its own tools, and a list of thousands of files would be re-read on every request. It is also told how omanote writes links, so "find my note about the ryokan and link it here" leaves a link you can follow, and that GitHub vaults sync themselves, so it never commits or pushes in them.
+- **It knows your inbox.** The same file says where your quick captures live (`inbox.md` in the default vault) and how they are written, so "add that to my inbox" and "what did I jot down this week?" work: the agent adds with `omanote --capture`, in the same format as your own captures.
 - `Ctrl+G` again moves the keyboard between the note and the agent; a click does the same. Quit the agent and the pane closes. If it quits the moment it starts, the pane stays up so you can read why.
 - The note is saved before the agent opens, saves as you type, and reloads by itself when the agent edits the file, so you can watch changes land.
 - In the pane, drag with the mouse to select text: it is copied when you let go, ready to paste into the note with `Ctrl+V`. The wheel scrolls back through the conversation; any key returns to the present.
-- The pane's title names the agent and the note it was given.
 - In a window too narrow for two columns, whichever side has the keyboard gets the whole window.
 
 Add your own agents, change how a known one is started, or skip the menu, in the settings (`omanote --config`):
 
 ```toml
 agent.Work bot = "workbot --chat {context}"
-agent.claude   = "claude --model opus --append-system-prompt {context}"
+agent.claude   = "claude --model opus --add-dir {nowdir} --append-system-prompt {context}"
 assistant      = "codex"          # always this one: a name, or a full command
 ```
 
-`{context}` is the description above, `{file}` the note and `{dir}` the folder the agent starts in. The pane is a small terminal emulator: colours, full-screen programs and paste work. The mouse belongs to omanote (select, scroll), so the agent itself never sees it, and terminal-specific extras are not passed through.
+`{context}` is the description above, `{file}` the note and `{dir}` the folder the agent starts in; `{now}` is the file that follows you between notes and `{nowdir}` its folder. The pane is a small terminal emulator: colours, full-screen programs and paste work. The mouse belongs to omanote (select, scroll), so the agent itself never sees it, and terminal-specific extras are not passed through.
 
 ### Tables
 
@@ -157,6 +191,8 @@ omanote --vlgh owner/repo          # clone a GitHub repo and add it
 omanote --vls                      # list vaults
 omanote --vlrm notes               # forget a vault (files are kept)
 ```
+
+The status line says where the open note is: the vault and the folder inside it in front of the name (`md-notes/trips/japan.md`), or the folder itself for a file outside every vault (`~/Work/report.md`). In a narrow column a long location loses its front, not its end.
 
 Vaults are recorded in `~/.omanote/origins.toml`. GitHub vaults are cloned into `~/.omanote/vaults`.
 

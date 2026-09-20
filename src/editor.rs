@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use crate::images::Images;
 use crate::layout::{VRow, layout, locate};
-use crate::markdown::{Block, classify, continuation, data_definition, task_mark};
+use crate::markdown::{Block, LinkTo, classify, continuation, data_definition, definition, link_at, task_mark};
 use crate::table::{self, Role};
 
 const UNDO_LIMIT: usize = 500;
@@ -41,6 +41,8 @@ pub struct View {
     pub h: u16,
     /// (line, visual row within the line) for each screen row.
     pub rows: Vec<(usize, usize)>,
+    /// The "go back" label in the status line, when shown: (row, from, to).
+    pub back: Option<(u16, u16, u16)>,
 }
 
 pub struct Editor {
@@ -258,6 +260,31 @@ impl Editor {
     /// Lines showing raw markdown: the cursor's, plus any the selection touches.
     pub fn is_revealed(&self, row: usize) -> bool {
         row == self.cursor.row || self.selection().is_some_and(|(s, e)| s.row <= row && row <= e.row)
+    }
+
+    /// The link at `pos`, with a `[text][label]` reference already looked up.
+    /// Code and plain text have no links.
+    pub fn link_at(&self, pos: Pos) -> Option<LinkTo> {
+        if !self.markdown || matches!(self.blocks.get(pos.row)?, Block::Code | Block::FenceOpen | Block::FenceClose | Block::Plain | Block::Comment) {
+            return None;
+        }
+        match link_at(self.lines.get(pos.row)?, pos.col)? {
+            LinkTo::Label(label) => {
+                let label = label.trim().to_lowercase();
+                self.lines.iter().filter_map(|l| definition(l)).find(|(l, _)| *l == label).map(|(_, target)| LinkTo::Target(target))
+            }
+            link => Some(link),
+        }
+    }
+
+    /// Swap `from..to` on the cursor's line for `text`, as one undo step.
+    pub fn replace_on_line(&mut self, from: usize, to: usize, text: &str) {
+        let row = self.cursor.row;
+        let len = self.lines[row].len();
+        self.anchor = Some(Pos { row, col: from.min(len) });
+        self.cursor = Pos { row, col: to.min(len) };
+        self.insert_str(text);
+        self.anchor = None;
     }
 
     pub fn selected_text(&self) -> Option<String> {
@@ -535,7 +562,7 @@ impl Editor {
         if w != self.view.w {
             self.goal_x = None;
         }
-        self.view = View { x, y, w, h, rows: Vec::new() };
+        self.view = View { x, y, w, h, rows: Vec::new(), back: None };
         if self.markdown {
             self.images.prepare(&self.lines, &self.embeds, w, (h * 3 / 5).max(4));
         }
@@ -993,6 +1020,56 @@ impl Editor {
 
     /// Wrap the selection in `delim` (or unwrap it if it already is). With no
     /// selection, insert an empty pair and put the cursor inside.
+    /// Links can be written here: markdown text, not code, and not already
+    /// inside a link's brackets (where a pasted address is just the address).
+    pub fn takes_links(&self) -> bool {
+        let Pos { row, col } = self.selection().map_or(self.cursor, |(s, _)| s);
+        let line = &self.lines[row];
+        let inside = col >= 1 && (line[col - 1] == '<' || (col >= 2 && line[col - 1] == '(' && line[col - 2] == ']'));
+        self.markdown && matches!(self.blocks.get(row), Some(Block::Normal | Block::Table { .. })) && !inside
+    }
+
+    /// Ctrl+K, and a web address pasted over a selection: the selected text
+    /// becomes a link. With an address it is complete, `[text](url)`; without,
+    /// the cursor waits between the brackets of `[text]()` for one to be
+    /// typed, pasted, or picked with `@`. Nothing selected starts an empty link.
+    pub fn link_selection(&mut self, url: Option<&str>) -> Result<(), &'static str> {
+        let (s, e) = self.selection().unwrap_or((self.cursor, self.cursor));
+        if s.row != e.row {
+            return Err("A link fits on a single line: select less");
+        }
+        let text: String = self.lines[s.row][s.col..e.col].iter().collect();
+        // An address that is selected is the target, not the text.
+        let (text, url) = match url {
+            None if text.starts_with("http://") || text.starts_with("https://") => (String::new(), Some(text.replace('(', "%28").replace(')', "%29"))),
+            url => (text, url.map(str::to_string)),
+        };
+        let link = format!("[{text}]({})", url.as_deref().unwrap_or(""));
+        self.anchor = Some(s);
+        self.cursor = e;
+        if s == e {
+            self.anchor = None;
+            self.checkpoint(Edit::Other);
+            self.insert_raw(&link);
+            self.edited(Edit::Other);
+        } else {
+            self.insert_str(&link);
+        }
+        self.anchor = None;
+        // Wherever something is still missing: the text first, then the address.
+        let end = self.cursor.col;
+        self.cursor.col = if text.is_empty() { s.col + 1 } else if url.is_none() { end - 1 } else { end };
+        Ok(())
+    }
+
+    /// A web address from the clipboard, written as a link. It goes in as the
+    /// plain address first, so one undo gives exactly that back.
+    pub fn paste_link(&mut self, url: &str, link: &str) {
+        self.insert_str(url);
+        let end = self.cursor.col;
+        self.replace_on_line(end - url.chars().count(), end, link);
+    }
+
     pub fn toggle_wrap(&mut self, delim: &str) -> Result<(), &'static str> {
         let d: Vec<char> = delim.chars().collect();
         let n = d.len();
@@ -1078,6 +1155,15 @@ impl Editor {
         }
         self.edited(Edit::Other);
         text
+    }
+}
+
+#[cfg(test)]
+impl Editor {
+    fn with_cursor_at_end(mut self) -> Self {
+        let row = self.lines.len() - 1;
+        self.cursor = Pos { row, col: self.lines[row].len() };
+        self
     }
 }
 
@@ -1429,4 +1515,54 @@ mod tests {
         assert_eq!(e.cut(), "b\n");
         assert_eq!(e.text(), "a\nc\n");
     }
+    #[test]
+    fn links_the_selection_or_starts_a_link() {
+        let mut ed = Editor::new("read the docs today", None);
+        ed.cursor = Pos { row: 0, col: 13 };
+        ed.anchor = Some(Pos { row: 0, col: 5 });
+        assert!(ed.takes_links());
+        ed.link_selection(Some("https://omarchy.org")).unwrap();
+        assert_eq!(ed.text(), "read [the docs](https://omarchy.org) today\n");
+        assert_eq!((ed.cursor.col, ed.selection()), (36, None), "after the finished link");
+        assert!(ed.undo());
+        assert_eq!(ed.text(), "read the docs today\n");
+
+        // No address yet: the cursor waits between the brackets for one.
+        ed.cursor = Pos { row: 0, col: 13 };
+        ed.anchor = Some(Pos { row: 0, col: 5 });
+        ed.link_selection(None).unwrap();
+        assert_eq!((ed.text().as_str(), ed.cursor.col), ("read [the docs]() today\n", 16));
+        assert!(!ed.takes_links(), "an address pasted here is just the address");
+
+        // Nothing selected: an empty link, text first.
+        let mut ed = Editor::new("see ", None);
+        ed.cursor = Pos { row: 0, col: 4 };
+        ed.link_selection(None).unwrap();
+        assert_eq!((ed.text().as_str(), ed.cursor.col), ("see []()\n", 5));
+
+        // A selected address is what the link points at; it needs words.
+        let mut ed = Editor::new("https://x.org/a_(b)", None);
+        ed.select_all();
+        ed.link_selection(None).unwrap();
+        assert_eq!((ed.text().as_str(), ed.cursor.col), ("[](https://x.org/a_%28b%29)\n", 1));
+
+        let mut ed = Editor::new("one\ntwo", None);
+        ed.select_all();
+        assert!(ed.link_selection(None).is_err());
+        assert!(!Editor::new("```\ncode", None).with_cursor_at_end().takes_links());
+    }
+
+    #[test]
+    fn a_pasted_address_can_be_undone_to_the_plain_one() {
+        let mut ed = Editor::new("see ", None);
+        ed.cursor = Pos { row: 0, col: 4 };
+        ed.paste_link("https://omarchy.org/docs", "[omarchy.org/docs](https://omarchy.org/docs)");
+        assert_eq!(ed.text(), "see [omarchy.org/docs](https://omarchy.org/docs)\n");
+        assert_eq!(ed.cursor.col, 48);
+        assert!(ed.undo());
+        assert_eq!(ed.text(), "see https://omarchy.org/docs\n", "first undo: the address as it was copied");
+        assert!(ed.undo());
+        assert_eq!(ed.text(), "see \n");
+    }
+
 }

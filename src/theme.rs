@@ -22,6 +22,7 @@ pub struct Theme {
     raised: Option<Color>,
     muted: Color,
     faint: Color,
+    shadow: Option<Color>,
 }
 
 static THEME: OnceLock<Theme> = OnceLock::new();
@@ -48,8 +49,9 @@ impl Theme {
                 raised: Some(mix(bg, fg, 0.20)),
                 muted: mix(fg, bg, 0.38),
                 faint: mix(fg, bg, 0.66),
+                shadow: Some(mix(bg, (0, 0, 0), 0.45)),
             },
-            None => Theme { rich: false, surface: None, raised: None, muted: Color::DarkGray, faint: Color::DarkGray },
+            None => Theme { rich: false, surface: None, raised: None, muted: Color::DarkGray, faint: Color::DarkGray, shadow: None },
         }
     }
 
@@ -69,6 +71,11 @@ impl Theme {
     /// Secondary text: labels, counts, paths.
     pub fn muted(&self) -> Style {
         Style::new().fg(self.muted)
+    }
+
+    /// What a popup casts on the page behind it: darker than the background.
+    pub fn shadow(&self) -> Option<Color> {
+        self.shadow
     }
 
     /// Rules and separators.

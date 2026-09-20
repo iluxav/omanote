@@ -392,26 +392,14 @@ fn find_close(ch: &[char], i: usize, end: usize, c: char, len: usize) -> Option<
 }
 
 /// `[text](url)` or `[[target|alias]]` starting at `i`. Returns the index after it.
-fn link(ch: &[char], i: usize, end: usize, base: Style, cells: &mut [CharCell]) -> Option<usize> {
+/// Where a link that opens at `ch[i] == '['` closes: `(wiki, j, k)`. For
+/// `[[target]]`, `j` is the first `]` and `k` the second. For `[text](url)`
+/// and `[text][label]`, `j` closes the text and `k` closes the target.
+fn link_span(ch: &[char], i: usize, end: usize) -> Option<(bool, usize, usize)> {
     if i + 1 < end && ch[i + 1] == '[' {
         let j = (i + 2..end.saturating_sub(1)).find(|&k| ch[k] == ']' && ch[k + 1] == ']')?;
-        if j == i + 2 {
-            return None;
-        }
-        for k in [i, i + 1, j, j + 1] {
-            hide(cells, k);
-        }
-        for cell in &mut cells[i + 2..j] {
-            cell.style = base.patch(link_style());
-        }
-        if let Some(p) = (i + 2..j).find(|&k| ch[k] == '|') {
-            for k in i + 2..=p {
-                hide(cells, k);
-            }
-        }
-        return Some(j + 2);
+        return (j != i + 2).then_some((true, j, j + 1));
     }
-
     let mut depth = 0usize;
     let mut close = None;
     for k in i..end {
@@ -434,8 +422,24 @@ fn link(ch: &[char], i: usize, end: usize, base: Style, cells: &mut [CharCell]) 
     // `[text](url)`, or the reference form `[text][label]`.
     let closer = if ch[j + 1] == '(' { ')' } else { ']' };
     let k = (j + 2..end).find(|&k| ch[k] == closer)?;
-    if k == j + 2 {
-        return None;
+    (k != j + 2).then_some((false, j, k))
+}
+
+fn link(ch: &[char], i: usize, end: usize, base: Style, cells: &mut [CharCell]) -> Option<usize> {
+    let (wiki, j, k) = link_span(ch, i, end)?;
+    if wiki {
+        for m in [i, i + 1, j, k] {
+            hide(cells, m);
+        }
+        for cell in &mut cells[i + 2..j] {
+            cell.style = base.patch(link_style());
+        }
+        if let Some(p) = (i + 2..j).find(|&m| ch[m] == '|') {
+            for m in i + 2..=p {
+                hide(cells, m);
+            }
+        }
+        return Some(k + 1);
     }
     hide(cells, i);
     for m in j..=k {
@@ -443,6 +447,43 @@ fn link(ch: &[char], i: usize, end: usize, base: Style, cells: &mut [CharCell]) 
     }
     inline(ch, i + 1, j, base.patch(link_style()), cells);
     Some(k + 1)
+}
+
+/// What a link points at, as written in the note.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LinkTo {
+    /// `[text](target)`: a web address or a file.
+    Target(String),
+    /// `[[note]]`: a note, by name.
+    Wiki(String),
+    /// `[text][label]`: defined on a `[label]: target` line somewhere else.
+    Label(String),
+}
+
+/// The link the cursor is in (or touching the end of), or a bare web address.
+pub fn link_at(ch: &[char], col: usize) -> Option<LinkTo> {
+    let text = |a: usize, b: usize| ch[a..b].iter().collect::<String>();
+    let mut i = 0;
+    while i < ch.len() {
+        let Some((wiki, j, k)) = (ch[i] == '[').then(|| link_span(ch, i, ch.len())).flatten() else {
+            i += 1;
+            continue;
+        };
+        if (i..=k + 1).contains(&col) {
+            return Some(match (wiki, ch[j + 1]) {
+                (true, _) => LinkTo::Wiki(text(i + 2, j)),
+                (false, '(') => LinkTo::Target(text(j + 2, k)),
+                (false, _) => LinkTo::Label(text(j + 2, k)),
+            });
+        }
+        i = k + 1;
+    }
+    // No markup: the word under the cursor, if it is an address.
+    let from = (0..col.min(ch.len())).rev().find(|&m| ch[m].is_whitespace()).map_or(0, |m| m + 1);
+    let to = (col.min(ch.len())..ch.len()).find(|&m| ch[m].is_whitespace()).unwrap_or(ch.len());
+    let word = text(from, to);
+    let word = word.trim_matches(|c: char| "<>()[]\"'".contains(c)).trim_end_matches(['.', ',', ';', ':', '!', '?']);
+    (word.starts_with("http://") || word.starts_with("https://")).then(|| LinkTo::Target(word.to_string()))
 }
 
 fn starts_with(ch: &[char], i: usize, end: usize, s: &str) -> bool {
@@ -639,4 +680,18 @@ mod tests {
             [Block::Normal, Block::FenceOpen, Block::Code, Block::FenceClose, Block::Normal]
         );
     }
+    #[test]
+    fn finds_the_link_under_the_cursor() {
+        let line: Vec<char> = "see [the plan](trips/plan.md), [[Ideas|mine]] and [docs][d] or https://omarchy.org.".chars().collect();
+        let at = |needle: &str| line.iter().collect::<String>().find(needle).unwrap();
+        assert_eq!(link_at(&line, 1), None);
+        assert_eq!(link_at(&line, at("[the")), Some(LinkTo::Target("trips/plan.md".into())));
+        assert_eq!(link_at(&line, at("plan]")), Some(LinkTo::Target("trips/plan.md".into())), "on the text, as when the syntax is hidden");
+        assert_eq!(link_at(&line, at(", [[")), Some(LinkTo::Target("trips/plan.md".into())), "right after it, where a mention leaves the cursor");
+        assert_eq!(link_at(&line, at("Ideas")), Some(LinkTo::Wiki("Ideas|mine".into())));
+        assert_eq!(link_at(&line, at("docs]")), Some(LinkTo::Label("d".into())));
+        assert_eq!(link_at(&line, at("omarchy")), Some(LinkTo::Target("https://omarchy.org".into())), "a bare address, without the full stop");
+        assert_eq!(link_at(&line, at(" and ") + 2), None);
+    }
+
 }

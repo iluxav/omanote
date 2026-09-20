@@ -129,8 +129,10 @@ impl Picker {
         // Notes are already newest-first, and the sort is stable, so ties stay in that order.
         scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
         // When something matches well, names that merely happen to contain the
-        // letters somewhere are noise, not candidates.
-        if let Some(&(best, _)) = scored.first().filter(|(best, _)| *best > 0) {
+        // letters somewhere are noise, not candidates. Not for a letter or two,
+        // though: that is someone still typing, and hiding notes would mislead.
+        let typed = terms.iter().map(Vec::len).sum::<usize>();
+        if let Some(&(best, _)) = scored.first().filter(|(best, _)| *best > 0 && typed >= 3) {
             scored.retain(|(score, _)| score * 3 >= best);
         }
         self.hits = scored.into_iter().map(|(_, hit)| hit).collect();
@@ -200,6 +202,43 @@ impl Picker {
         if n > 0 {
             self.selected = (self.selected as isize + delta).rem_euclid(n as isize) as usize;
         }
+    }
+
+    /// Replace the whole query, keeping the selection if nothing changed.
+    pub fn set_query(&mut self, query: &str) {
+        if self.query != query {
+            self.query = query.to_string();
+            self.refresh();
+        }
+    }
+
+    /// Leave one note out: the note being written has no use for a link to itself.
+    pub fn exclude(&mut self, path: &Path) {
+        self.notes.retain(|n| n.path != path);
+        self.refresh();
+    }
+
+    /// How many notes match, not counting the offer to create one.
+    pub fn matches(&self) -> usize {
+        self.hits.len()
+    }
+
+    /// Notes called exactly `name`: a bare name (`ideas`) or one with folders
+    /// (`work/ideas`), any case, with or without the extension.
+    pub fn named(&self, name: &str) -> Vec<&Path> {
+        let name = name.trim().trim_end_matches(".markdown").trim_end_matches(".md");
+        let wanted = loose(name);
+        let folders = name.contains('/');
+        let is = |n: &&Note| {
+            let full: String = n.name.iter().collect();
+            if folders {
+                let full = loose(&full);
+                full == wanted || full.ends_with(&format!("/{wanted}"))
+            } else {
+                loose(&n.path.file_stem().unwrap_or_default().to_string_lossy()) == wanted
+            }
+        };
+        self.notes.iter().filter(is).map(|n| n.path.as_path()).collect()
     }
 
     pub fn push(&mut self, text: &str) {
@@ -496,9 +535,39 @@ mod tests {
     }
 
     #[test]
+    fn a_letter_or_two_hides_nothing() {
+        let root = temp_vault(&["ideas.md", "lisbon.md", "packing list.md", "zebra.md"]);
+        let mut p = Picker::open(&[Vault { path: root.clone(), github: None }]);
+        p.push("i");
+        assert_eq!(p.len(), 4, "ideas first, but lisbon and packing list are still offered (plus the create row)");
+        let Some(Row::Note(first, _)) = p.row(0) else { panic!() };
+        assert_eq!(first.name.iter().collect::<String>(), "ideas");
+        p.clear();
+        p.push("ide");
+        assert_eq!(p.len(), 2, "by three letters the weak matches are gone");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn missing_vault_is_just_empty() {
         let p = Picker::open(&[Vault { path: "/nonexistent/omanote/vault".into(), github: None }]);
         assert_eq!((p.total(), p.len()), (0, 0));
         assert_eq!(p.chosen(), None);
     }
+    #[test]
+    fn finds_notes_by_their_exact_name() {
+        let root = temp_vault(&["My Ideas.md", "work/ideas.md", "homework/ideas.md", "ideas-old.md"]);
+        let p = Picker::open(&[Vault { path: root.clone(), github: None }]);
+        let names = |q: &str| {
+            let mut found: Vec<_> = p.named(q).iter().map(|f| f.strip_prefix(&root).unwrap().to_string_lossy().into_owned()).collect();
+            found.sort();
+            found
+        };
+        assert_eq!(names("ideas"), ["homework/ideas.md", "work/ideas.md"], "the name, not names that contain it");
+        assert_eq!(names("my-ideas.md"), ["My Ideas.md"]);
+        assert_eq!(names("work/ideas"), ["work/ideas.md"], "a folder narrows it, and homework is not work");
+        assert!(names("nothing").is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
 }

@@ -8,6 +8,8 @@ mod editor;
 mod images;
 mod layout;
 mod markdown;
+mod mention;
+mod now;
 mod pane;
 mod picker;
 mod saveas;
@@ -19,6 +21,7 @@ mod vaults;
 
 use std::io::{Write, stdout};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use ratatui::Terminal;
@@ -38,6 +41,7 @@ use ratatui::crossterm::terminal::{
 
 use editor::{Editor, Pos};
 use images::Images;
+use mention::{Dest, Mention};
 use picker::{Picker, Resolution};
 use saveas::{After, SaveAs};
 
@@ -50,10 +54,31 @@ const PULL_PATIENCE: Duration = Duration::from_secs(8);
 /// Pasted images wider than this are scaled down before they are embedded.
 const PASTE_MAX_WIDTH: u32 = 2000;
 
+/// The note that does not have the keyboard, when two are open side by side.
+/// The one being written in is always `App::ed`; changing sides swaps them,
+/// so everything the editor can do works the same on either side.
+struct Parked {
+    ed: Editor,
+    history: Vec<(PathBuf, Pos)>,
+    forward: Vec<(PathBuf, Pos)>,
+    seen_saves: u64,
+}
+
 struct App {
     ed: Editor,
+    other: Option<Parked>,
+    /// With two notes open: the one being written in is the right-hand one.
+    on_right: bool,
+    /// Where the other note is on screen (if there is room for it), for the mouse.
+    other_area: Option<ratatui::layout::Rect>,
     picker: Option<Picker>,
     save_as: Option<SaveAs>,
+    /// The note suggestions open under an `@` being typed.
+    mention: Option<Mention>,
+    /// Notes left behind on the way here, and where the cursor was in each:
+    /// Alt+← walks back through them, Alt+→ forward again.
+    history: Vec<(PathBuf, Pos)>,
+    forward: Vec<(PathBuf, Pos)>,
     /// The assistant's terminal beside the note, and whether it has the keyboard.
     pane: Option<pane::Pane>,
     pane_focused: bool,
@@ -62,6 +87,13 @@ struct App {
     /// pane then stays up until a key is pressed, so the reason can be read.
     pane_started: Instant,
     pane_failed: bool,
+    /// The file that tells the agent what is on screen now, the agent's name
+    /// and the folder it runs in. The file goes when the pane does.
+    now: Option<now::Now>,
+    pane_agent: String,
+    pane_dir: PathBuf,
+    pane_inbox: Option<PathBuf>,
+    pane_vaults: Vec<(PathBuf, bool)>,
     /// Where the note ends and the pane begins, and where the assistant's
     /// screen is inside the pane, for routing the mouse.
     pane_x: u16,
@@ -139,6 +171,7 @@ impl App {
         if let Some(msg) = self.sync.tick() {
             self.say(msg);
         }
+        self.refresh_other();
         let Some(path) = self.ed.path.clone() else { return };
         let on_disk = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
         if on_disk.is_none() || on_disk == self.ed.disk_mtime {
@@ -159,6 +192,27 @@ impl App {
     }
 
     /// A note without a file that has something in it worth keeping.
+    /// The note beside this one changed on disk (the agent, a sync): show that.
+    /// It was saved when the keyboard left it, so there is nothing to lose.
+    fn refresh_other(&mut self) {
+        let Some(parked) = &self.other else { return };
+        let Some(path) = parked.ed.path.clone() else { return };
+        let on_disk = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        if on_disk.is_none() || on_disk == parked.ed.disk_mtime || parked.ed.dirty {
+            return;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else { return };
+        let (cursor, top, top_skip) = (parked.ed.cursor, parked.ed.top, parked.ed.top_skip);
+        let mut fresh = self.editor_with(&text, Some(path), parked.ed.images.high_ids());
+        let row = cursor.row.min(fresh.lines.len() - 1);
+        fresh.move_to(Pos { row, col: cursor.col.min(fresh.lines[row].len()) }, false);
+        (fresh.top, fresh.top_skip) = (top.min(fresh.lines.len() - 1), top_skip);
+        if let Some(parked) = &mut self.other {
+            parked.ed = fresh;
+            parked.seen_saves = 0;
+        }
+    }
+
     fn unsaved_draft(&self) -> bool {
         self.ed.path.is_none() && self.ed.dirty && self.ed.lines.iter().any(|l| l.iter().any(|c| !c.is_whitespace()))
     }
@@ -237,13 +291,21 @@ impl App {
         let dir = in_vault.cloned().or_else(|| path.parent().map(PathBuf::from)).unwrap_or_else(|| PathBuf::from("."));
         let file = path.strip_prefix(&dir).unwrap_or(&path).to_string_lossy().into_owned();
 
+        let now = match now::Now::new(&vaults::home()) {
+            Ok(now) => now,
+            Err(e) => return self.say(format!("Could not write the agent's context file: {e}")),
+        };
         let mut context = format!(
-            "The user is writing a markdown note in omanote, a terminal editor, and you are in a pane beside it. \
-             The note is {file} (full path: {}); their cursor is on line {}. omanote saves as they type and reloads \
-             the file when it changes on disk, so when asked to change the text, edit the file directly. \
-             Your pane is narrow: keep replies short.",
+            "The user is writing markdown notes in omanote, a terminal editor, and you are in a pane beside it. \
+             Right now the note is {file} (full path: {}) and their cursor is on line {}. They move between notes \
+             while you run, so before acting on \"this note\", \"here\", \"this line\" or \"what I selected\", read {}: \
+             omanote keeps that file up to date with the note that is open, the cursor line and the selected text, \
+             and it says where their other notes are and how to work with them and their inbox. \
+             omanote saves as they type and reloads a note when it changes on disk, so when asked to change the \
+             text, edit the file directly. Your pane is narrow: keep replies short.",
             path.display(),
-            self.ed.cursor.row + 1
+            self.ed.cursor.row + 1,
+            now.path().display()
         );
         if let Some(selected) = self.ed.selected_text().filter(|t| !t.trim().is_empty()) {
             let selected: String = selected.chars().take(4000).collect();
@@ -253,20 +315,52 @@ impl App {
             .command
             .replace("{context}", "\"$OMANOTE_CONTEXT\"")
             .replace("{file}", "\"$OMANOTE_FILE\"")
-            .replace("{dir}", "\"$OMANOTE_DIR\"");
-        let env = [("OMANOTE_CONTEXT", context), ("OMANOTE_FILE", file), ("OMANOTE_DIR", dir.to_string_lossy().into_owned())];
+            .replace("{dir}", "\"$OMANOTE_DIR\"")
+            .replace("{nowdir}", "\"$OMANOTE_NOW_DIR\"")
+            .replace("{now}", "\"$OMANOTE_NOW\"");
+        let env = [
+            ("OMANOTE_CONTEXT", context),
+            ("OMANOTE_FILE", file),
+            ("OMANOTE_DIR", dir.to_string_lossy().into_owned()),
+            ("OMANOTE_NOW", now.path().to_string_lossy().into_owned()),
+            ("OMANOTE_NOW_DIR", now.dir().to_string_lossy().into_owned()),
+        ];
         match pane::Pane::spawn(&command, &dir, &env, 24, 60) {
-            Ok(mut pane) => {
-                // Say which note it was given: the context itself is invisible.
-                let note = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                pane.label = format!("{} · {note}", agent.name);
+            Ok(pane) => {
                 self.pane = Some(pane);
+                self.now = Some(now);
+                self.pane_agent = agent.name.clone();
+                self.pane_dir = dir;
+                self.pane_inbox = all.first().map(|v| capture::inbox(&v.path));
+                self.pane_vaults = all.iter().map(|v| (v.path.clone(), v.github.is_some())).collect();
+                // Before the agent has had time to look.
+                self.tell_agent();
                 self.pane_started = Instant::now();
                 self.pane_failed = false;
                 self.pane_focused = true;
                 self.repaint = true;
             }
             Err(e) => self.say(e),
+        }
+    }
+
+    /// Keep the agent's view of things true: the file it was told to read,
+    /// and the pane's title, which is how you can see what it has been told.
+    fn tell_agent(&mut self) {
+        let (Some(now), false) = (&mut self.now, self.pane_failed) else { return };
+        let ed = &self.ed;
+        let note = ed.path.as_ref().map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()));
+        let text: String = ed.lines[ed.cursor.row].iter().collect();
+        let selected = ed.selected_text();
+        let beside = self.other.as_ref().and_then(|o| o.ed.path.as_ref()).map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()));
+        let looking = now::Looking { note: note.as_deref(), dir: &self.pane_dir, line: ed.cursor.row + 1, text: &text, selected: selected.as_deref(), unsaved: ed.dirty, inbox: self.pane_inbox.as_deref(), beside: beside.as_deref().map(|p| (p, !self.on_right)), vaults: &self.pane_vaults };
+        if let Err(e) = now.set(now::describe(&looking)) {
+            self.now = None;
+            return self.say(format!("The agent can no longer be told where you are: {e}"));
+        }
+        let name = note.as_ref().and_then(|p| p.file_name()).map_or("a new note".into(), |n| n.to_string_lossy().into_owned());
+        if let Some(pane) = &mut self.pane {
+            pane.label = format!("{} · {name}", self.pane_agent);
         }
     }
 
@@ -290,11 +384,12 @@ impl App {
     fn close_pane(&mut self) {
         {
             self.pane = None;
+            self.now = None;
             self.pane_failed = false;
             self.pane_focused = false;
             self.pane_x = u16::MAX;
             self.repaint = true;
-            self.say("Assistant closed");
+            self.say("AI chat closed");
         }
     }
 
@@ -407,6 +502,12 @@ impl App {
         self.sync.flush();
         self.picker = None;
         self.wanted = None;
+        // Alt+← leads back to the note this one was started from.
+        if let Some(from) = self.ed.path.clone() {
+            self.history.push((from, self.ed.cursor));
+            self.forward.clear();
+        }
+        self.mention = None;
         self.ed = self.editor("", None);
         self.seen_saves = 0;
         self.say("New note — Ctrl+S to choose where it goes");
@@ -414,6 +515,10 @@ impl App {
 
     /// Switch to another note, saving the current one first.
     fn open(&mut self, path: PathBuf) {
+        // Two live copies of one file would overwrite each other: go to the one there is.
+        if self.is_other(&path) {
+            return self.swap_focus();
+        }
         if self.unsaved_draft() {
             return self.ask_where(After::Open(path));
         }
@@ -427,18 +532,114 @@ impl App {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(e) => return self.say(format!("Could not open {}: {e}", path.display())),
         };
+        // Wherever this was opened from (a link, Ctrl+P), Alt+← leads back.
+        if let Some(from) = self.ed.path.clone().filter(|p| *p != path) {
+            self.history.push((from, self.ed.cursor));
+            self.history.drain(..self.history.len().saturating_sub(HISTORY));
+            self.forward.clear();
+        }
         // Send what the last note left behind, and freshen the new one's vault.
         self.note_saves();
         self.sync.flush();
         self.sync.opened(&path, &vaults::all(&vaults::home()));
         self.ed = self.editor(&text, Some(path));
         self.seen_saves = 0;
+        self.mention = None;
     }
 
     fn editor(&self, text: &str, path: Option<PathBuf>) -> Editor {
+        self.editor_with(text, path, self.other.as_ref().is_some_and(|o| !o.ed.images.high_ids()))
+    }
+
+    /// `high_ids`: number its images apart from those of the note beside it.
+    fn editor_with(&self, text: &str, path: Option<PathBuf>, high_ids: bool) -> Editor {
         let vault = vaults::root_of(path.as_deref(), &vaults::all(&vaults::home()));
         let images = Images::new(self.image_mode, cell_pixels(), path.as_deref(), vault);
-        Editor::new(text, path).with_images(images)
+        Editor::new(text, path).with_images(if high_ids { images.with_high_ids() } else { images })
+    }
+
+    fn is_other(&self, path: &std::path::Path) -> bool {
+        let same = |a: &PathBuf| std::path::absolute(a).ok() == std::path::absolute(path).ok();
+        self.other.as_ref().is_some_and(|o| o.ed.path.as_ref().is_some_and(same))
+    }
+
+    /// F6, or a click in the other note: move the keyboard across.
+    fn swap_focus(&mut self) {
+        if self.other.is_none() {
+            return self.say("There is no other note open · Alt+O on a link opens it beside this one");
+        }
+        if self.ed.dirty && self.ed.path.is_some() {
+            if let Err(e) = self.ed.save() {
+                return self.say(format!("Could not save, staying here: {e}"));
+            }
+        }
+        self.note_saves();
+        let Some(mut parked) = self.other.take() else { return };
+        std::mem::swap(&mut self.ed, &mut parked.ed);
+        std::mem::swap(&mut self.history, &mut parked.history);
+        std::mem::swap(&mut self.forward, &mut parked.forward);
+        std::mem::swap(&mut self.seen_saves, &mut parked.seen_saves);
+        self.other = Some(parked);
+        self.on_right = !self.on_right;
+        self.mention = None;
+        self.toast = None;
+    }
+
+    /// Open a note on the right and keep this one on the left. With two notes
+    /// open already, the right-hand one is where it goes.
+    fn open_aside(&mut self, path: PathBuf) {
+        if self.is_other(&path) {
+            return self.swap_focus();
+        }
+        if self.other.is_some() {
+            if !self.on_right {
+                self.swap_focus();
+            }
+            return self.open(path);
+        }
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return self.say(format!("Could not open {}: {e}", path.display())),
+        };
+        if self.ed.dirty && self.ed.path.is_some() {
+            if let Err(e) = self.ed.save() {
+                return self.say(format!("Could not save, staying here: {e}"));
+            }
+        }
+        self.note_saves();
+        let left = std::mem::replace(&mut self.ed, Editor::new("", None));
+        self.other = Some(Parked { ed: left, history: std::mem::take(&mut self.history), forward: std::mem::take(&mut self.forward), seen_saves: self.seen_saves });
+        self.on_right = true;
+        self.sync.opened(&path, &vaults::all(&vaults::home()));
+        self.ed = self.editor(&text, Some(path));
+        self.seen_saves = 0;
+        self.mention = None;
+        self.repaint = true;
+    }
+
+    /// Ctrl+Q with two notes open closes the one being written in; the other
+    /// gets the window, and the keyboard.
+    fn close_side(&mut self) {
+        if self.unsaved_draft() {
+            return self.ask_where(After::Quit);
+        }
+        if self.ed.dirty && self.ed.path.is_some() {
+            if let Err(e) = self.ed.save() {
+                return self.say(format!("Could not save, staying here: {e}"));
+            }
+        }
+        self.note_saves();
+        self.sync.flush();
+        let Some(parked) = self.other.take() else { return };
+        self.ed = parked.ed;
+        self.history = parked.history;
+        self.forward = parked.forward;
+        self.seen_saves = parked.seen_saves;
+        self.on_right = false;
+        self.other_area = None;
+        self.mention = None;
+        self.repaint = true;
     }
 
     fn picker_key(&mut self, key: KeyEvent) {
@@ -473,7 +674,20 @@ impl App {
         }
     }
 
+    /// Leaving without being able to ask anything: the window was closed.
+    fn leave(&mut self) {
+        if self.ed.dirty && self.ed.path.is_some() {
+            let _ = self.ed.save();
+        }
+        self.note_saves();
+        self.sync.flush();
+        self.quit = true;
+    }
+
     fn quit(&mut self) {
+        if self.other.is_some() {
+            return self.close_side();
+        }
         if self.unsaved_draft() {
             return self.ask_where(After::Quit);
         }
@@ -522,6 +736,127 @@ impl App {
         if self.picker.is_some() {
             return self.picker_key(key);
         }
+        if self.mention_key(key) {
+            return;
+        }
+        self.editor_key(key);
+        self.mention_after(key);
+    }
+
+    /// Keys the `@` suggestions keep for themselves. Everything else is typing,
+    /// and goes to the note as usual.
+    fn mention_key(&mut self, key: KeyEvent) -> bool {
+        let Some(m) = &mut self.mention else { return false };
+        let chord = key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        match key.code {
+            KeyCode::Esc => self.mention = None,
+            _ if m.picker.len() == 0 => return false,
+            KeyCode::Up | KeyCode::BackTab => m.picker.step(-1),
+            KeyCode::Down | KeyCode::Tab => m.picker.step(1),
+            KeyCode::Enter if !chord => self.link_mention(),
+            _ => return false,
+        }
+        true
+    }
+
+    /// After a key reached the note: keep the suggestions in step with what
+    /// now follows the `@`, or open them if an `@` was just typed.
+    fn mention_after(&mut self, key: KeyEvent) {
+        if self.picker.is_some() || self.save_as.is_some() || self.chooser.is_some() || self.pane_focused {
+            self.mention = None;
+        } else if let Some(m) = &mut self.mention {
+            if !m.update(&self.ed) {
+                self.mention = None;
+            }
+        } else if key.code == KeyCode::Char('@') && !key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.mention = Mention::begin(&self.ed, &vaults::all(&vaults::home()));
+        }
+    }
+
+    /// Enter on a suggestion: `@query` becomes a link to that note.
+    fn link_mention(&mut self) {
+        let Some(m) = self.mention.take() else { return };
+        let all = vaults::all(&vaults::home());
+        let got = match m.accept(self.ed.path.as_deref(), &all) {
+            Ok(got) => got,
+            Err(e) => return self.say(e),
+        };
+        if let Some(path) = &got.create {
+            if let Err(e) = start_note(path) {
+                return self.say(format!("Could not create {}: {e}", path.display()));
+            }
+        }
+        self.ed.replace_on_line(m.at, self.ed.cursor.col, &got.link);
+        // Inside `[text](…)` the link is finished: step out of the brackets.
+        if m.bare && self.ed.lines[self.ed.cursor.row].get(self.ed.cursor.col) == Some(&')') {
+            self.ed.right(false);
+        }
+        let how = if self.enhanced_keys { "Ctrl+Enter" } else { "Ctrl+O" };
+        match got.create {
+            Some(path) => self.say(format!("Created {} · {how} opens it", path.file_name().unwrap_or_default().to_string_lossy())),
+            None => self.say(format!("Linked · {how} opens it")),
+        }
+    }
+
+    /// Ctrl+O, Ctrl+Enter, Ctrl+click: go where the link at `pos` points.
+    fn follow(&mut self, pos: Pos, aside: bool) {
+        let Some(link) = self.ed.link_at(pos) else { return self.say("No link here to open") };
+        let all = vaults::all(&vaults::home());
+        let outside = |what: String| match mention::open_outside(&what) {
+            Ok(()) => format!("Opening {what}"),
+            Err(e) => e,
+        };
+        match mention::destination(&link, self.ed.path.as_deref(), &all) {
+            Err(e) => self.say(e),
+            Ok(Dest::Web(url)) => self.say(outside(url)),
+            Ok(Dest::File(path)) => self.say(outside(path.to_string_lossy().into_owned())),
+            Ok(Dest::Note(path)) => {
+                let here = self.ed.path.as_ref().and_then(|p| std::path::absolute(p).ok());
+                if here.is_some() && here == std::path::absolute(&path).ok() {
+                    return self.say("That is this note");
+                }
+                let fresh = !path.exists();
+                if aside { self.open_aside(path) } else { self.open(path) }
+                if fresh && self.save_as.is_none() {
+                    self.say("A new note: start writing, or Alt+← to go back");
+                }
+            }
+        }
+    }
+
+    /// Alt+← and Alt+→: through the notes visited, like a browser. Notes that
+    /// have since been moved or deleted are passed over.
+    fn travel(&mut self, back: bool) {
+        let (mut history, mut forward) = (std::mem::take(&mut self.history), std::mem::take(&mut self.forward));
+        let (from, onto) = if back { (&mut history, &mut forward) } else { (&mut forward, &mut history) };
+        let mut found = None;
+        while let Some((path, pos)) = from.pop() {
+            if path.exists() && !self.is_other(&path) {
+                found = Some((path, pos));
+                break;
+            }
+        }
+        match found {
+            None => self.say(if back { "No note to go back to" } else { "No note to go forward to" }),
+            Some((path, pos)) => {
+                let here = self.ed.path.clone().map(|p| (p, self.ed.cursor));
+                self.open(path.clone());
+                if self.ed.path.as_ref() == Some(&path) {
+                    onto.extend(here);
+                    let row = pos.row.min(self.ed.lines.len() - 1);
+                    self.ed.move_to(Pos { row, col: pos.col.min(self.ed.lines[row].len()) }, false);
+                    self.toast = None;
+                } else {
+                    from.push((path, pos));
+                }
+            }
+        }
+        // `open` kept its own record of this move; ours is the one that counts.
+        self.history = history;
+        self.forward = forward;
+    }
+
+    fn editor_key(&mut self, key: KeyEvent) {
         let ed = &mut self.ed;
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -529,6 +864,7 @@ impl App {
         match key.code {
             KeyCode::Char(c) if ctrl => match c.to_ascii_lowercase() {
                 'q' => self.quit(),
+                'o' => self.follow(self.ed.cursor, shift),
                 'p' => {
                     let all = vaults::all(&vaults::home());
                     self.sync.pull_all(&all);
@@ -551,21 +887,17 @@ impl App {
                     self.say("Copied");
                 }
                 'x' => clipboard::copy(&ed.cut()),
-                'v' => match clipboard::image() {
-                    Some(_) if !ed.markdown => self.say("Images can be pasted into markdown notes only"),
-                Some((mime, bytes)) => match images::embeddable(&mime, bytes, PASTE_MAX_WIDTH) {
-                        Ok(uri) => {
-                            let size = uri.len();
-                            let label = ed.paste_image(uri);
-                            self.say(format!("Image embedded as [{label}] · {}", ui::human(size)));
-                        }
-                        Err(e) => self.say(e),
-                    },
-                    None => {
-                        let text = clipboard::paste().unwrap_or_else(|| ed.clipboard.clone());
-                        ed.insert_str(&text);
+                'v' => self.paste_clipboard(),
+                'k' if !ed.markdown => self.say("That is a markdown shortcut; this file is plain text"),
+                'k' => {
+                    let url = clipboard::paste().and_then(|t| mention::as_url(&t).map(mention::url_target));
+                    let done = url.is_some();
+                    match ed.link_selection(url.as_deref()) {
+                        Ok(()) if done => self.say("Linked to the address in the clipboard"),
+                        Ok(()) => self.say("Type or paste the address · @ picks a note"),
+                        Err(msg) => self.say(msg),
                     }
-                },
+                }
                 'b' | 'i' | 't' if !ed.markdown => self.say("That is a markdown shortcut; this file is plain text"),
                 'b' => self.wrap("**"),
                 'i' => self.wrap("*"),
@@ -573,6 +905,8 @@ impl App {
                 'h' | 'w' => ed.delete_word_back(),
                 _ => {}
             },
+            // Ctrl+Shift+O needs a terminal that can tell it from Ctrl+O; Alt+O always works.
+            KeyCode::Char('o' | 'O') if alt => self.follow(self.ed.cursor, true),
             KeyCode::Char(c) if !alt => ed.insert_char(c),
             // Super+Shift is the natural chord, but most window managers keep Super
             // for themselves, so Alt+Shift does the same thing.
@@ -581,7 +915,10 @@ impl App {
                     self.say("Put the cursor in a table to add a column");
                 }
             }
+            KeyCode::Enter if ctrl => self.follow(self.ed.cursor, shift || alt),
             KeyCode::Enter if shift && ed.add_table_row() => {}
+            KeyCode::Left if alt => self.travel(true),
+            KeyCode::Right if alt => self.travel(false),
             KeyCode::Left if ctrl => ed.word_left(shift),
             KeyCode::Right if ctrl => ed.word_right(shift),
             KeyCode::Left => ed.left(shift),
@@ -602,8 +939,49 @@ impl App {
             KeyCode::Tab => ed.tab(),
             KeyCode::BackTab => ed.backtab(),
             KeyCode::F(2) => self.relocate(),
+            KeyCode::F(6) => self.swap_focus(),
             KeyCode::Esc => ed.clear_selection(),
             _ => {}
+        }
+    }
+
+    /// Ctrl+V: a picture in the clipboard is embedded, anything else is text.
+    fn paste_clipboard(&mut self) {
+        match clipboard::image() {
+            Some(_) if !self.ed.markdown => self.say("Images can be pasted into markdown notes only"),
+            Some((mime, bytes)) => match images::embeddable(&mime, bytes, PASTE_MAX_WIDTH) {
+                Ok(uri) => {
+                    let size = uri.len();
+                    let label = self.ed.paste_image(uri);
+                    self.say(format!("Image embedded as [{label}] · {}", ui::human(size)));
+                }
+                Err(e) => self.say(e),
+            },
+            None => {
+                let text = clipboard::paste().unwrap_or_else(|| self.ed.clipboard.clone());
+                self.paste_text(&text);
+            }
+        }
+    }
+
+    /// Pasted text, however it got here: Ctrl+V, or the terminal's own paste
+    /// (Super+V on Omarchy, Ctrl+Shift+V, the middle button). A web address
+    /// becomes a link: around the selected text if there is any, otherwise
+    /// under a short readable name.
+    fn paste_text(&mut self, text: &str) {
+        let ed = &mut self.ed;
+        match mention::as_url(text).filter(|_| ed.takes_links()) {
+            Some(url) if ed.selection().is_some() => {
+                if let Err(msg) = ed.link_selection(Some(&mention::url_target(url))) {
+                    self.say(msg);
+                }
+            }
+            Some(url) => {
+                let alone = ed.lines[ed.cursor.row].iter().all(|c| c.is_whitespace());
+                ed.paste_link(url, &mention::url_link(url, alone));
+                self.say("Pasted as a link · Ctrl+Z for the plain address");
+            }
+            None => ed.insert_str(text),
         }
     }
 
@@ -667,14 +1045,43 @@ impl App {
             }
             return;
         }
+        // Over the other note: the wheel scrolls it where it is, a click moves in.
+        if self.other_area.is_some_and(|r| (r.x..r.x + r.width).contains(&m.column)) {
+            match m.kind {
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                    let by = if m.kind == MouseEventKind::ScrollUp { -3 } else { 3 };
+                    if let Some(parked) = &mut self.other {
+                        parked.ed.scroll(by);
+                    }
+                    return;
+                }
+                MouseEventKind::Down(_) => self.swap_focus(),
+                _ => return,
+            }
+        }
+        // The wheel moves through the `@` suggestions; a click is the end of them.
+        if let Some(mention) = &mut self.mention {
+            match m.kind {
+                MouseEventKind::ScrollUp => return mention.picker.step(-1),
+                MouseEventKind::ScrollDown => return mention.picker.step(1),
+                MouseEventKind::Down(_) => self.mention = None,
+                _ => {}
+            }
+        }
         let ed = &mut self.ed;
         match m.kind {
             MouseEventKind::ScrollUp => ed.scroll(-3),
             MouseEventKind::ScrollDown => ed.scroll(3),
+            MouseEventKind::Down(MouseButton::Left) if ed.view.back.is_some_and(|(y, from, to)| m.row == y && (from..to).contains(&m.column)) => self.travel(true),
             MouseEventKind::Down(MouseButton::Left) => {
                 let (pos, checkbox) = ed.pos_at(m.column, m.row);
                 if checkbox {
                     return ed.toggle_task(pos.row);
+                }
+                // Ctrl+click follows a link here; with Alt, beside this note.
+                let aside = m.modifiers.contains(KeyModifiers::ALT);
+                if aside || m.modifiers.contains(KeyModifiers::CONTROL) {
+                    return self.follow(pos, aside);
                 }
                 let double = self.last_click.is_some_and(|(at, p)| at.elapsed() < DOUBLE_CLICK && p == pos);
                 if double {
@@ -715,7 +1122,16 @@ impl App {
             Event::Paste(text) => match (&mut self.save_as, &mut self.picker) {
                 (Some(prompt), _) => prompt.edit(|n| n.extend(text.chars().filter(|c| !c.is_control()))),
                 (None, Some(p)) => p.push(&text),
-                (None, None) => self.ed.insert_str(&text),
+                // A terminal asked to paste a picture has no text to send: look for ourselves.
+                (None, None) if text.is_empty() => self.paste_clipboard(),
+                (None, None) => {
+                    self.paste_text(&text);
+                    if let Some(m) = &mut self.mention {
+                        if !m.update(&self.ed) {
+                            self.mention = None;
+                        }
+                    }
+                }
             },
             _ => {}
         }
@@ -767,10 +1183,27 @@ omanote — a small markdown note editor
                               one match opens, several are listed (Tab, Enter),
                               none starts a new note. Case and .md do not matter.
   omanote <path/to/file.md>   open (or start) that file
+  omanote <note> --agent      …with the AI agent menu open (--agent=codex: that agent)
   omanote --demo              a note that shows off what the editor renders
   Ctrl+N inside the editor    start a new note (asks to save an unnamed one first)
   Ctrl+P inside the editor    fuzzy-find a note in any vault
   F2 inside the editor        move, rename or copy the note (another vault, another folder)
+  @ inside the editor         link a note: type @ and a few letters, pick from the list
+                              (the last entry creates a note by that name), Enter
+  Ctrl+K                      make the selected text a link: [text](), with the cursor
+                              where the address goes (type it, paste it, or @ to pick a
+                              note). An address already in the clipboard is filled in
+  Pasting a web address       (Ctrl+V, Super+V, the terminal's paste) makes a link: around the selected text, or under a short
+                              name (github.com/you/repo); Ctrl+Z gives the plain address
+  Ctrl+O on a link            open it: a note opens here (Alt+Left goes back), a web
+                              address or other file opens on the desktop. Ctrl+Enter
+                              and Ctrl+click do the same
+  Alt+O on a link             open it beside this note, on the right, and keep this one
+                              where it is (also Ctrl+Shift+O, Alt+click). Links in the
+                              right-hand note open there too. F6 or a click changes
+                              sides; Ctrl+Q closes the side you are in
+  Alt+Left / Alt+Right        back to the note you came from, and forward again; the
+                              status line names it, and a click on it goes there too
   Ctrl+G inside the editor    an AI agent in a pane beside the note: pick from the agent
                               CLIs you have installed (Claude Code, Codex, Gemini, …) or
                               your own from the settings. Ctrl+G again moves between the
@@ -824,9 +1257,11 @@ fn target(words: &[String]) -> Target {
 }
 
 /// Handle the flags that do their job and exit. Returns what is left: the note to open.
-fn cli(args: &[String]) -> Result<(Target, bool, bool), String> {
+fn cli(args: &[String]) -> Result<(Target, bool, bool, Option<String>), String> {
     let home = vaults::home();
     let (mut words, mut keys, mut demo) = (Vec::new(), false, false);
+    // `--agent`: open the assistant straight away ("" = ask which); `--agent=codex`: that one.
+    let mut agent: Option<String> = None;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         let mut value = |what: &str| it.next().cloned().ok_or(format!("{arg} needs {what}"));
@@ -843,7 +1278,7 @@ fn cli(args: &[String]) -> Result<(Target, bool, bool), String> {
             "--new" => {
                 // A new note no matter what exists; the words become its suggested name.
                 let name: Vec<String> = it.by_ref().cloned().collect();
-                return Ok((Target::New(name.join(" ")), keys, demo));
+                return Ok((Target::New(name.join(" ")), keys, demo, agent));
             }
             "--capture" => {
                 // Everything after the flag is the note, quoted or not.
@@ -854,7 +1289,7 @@ fn cli(args: &[String]) -> Result<(Target, bool, bool), String> {
             "--config" => {
                 // Open the settings in the editor itself; saving applies them.
                 let file = config::ensure(&home).map_err(|e| format!("cannot write the config: {e}"))?;
-                return Ok((Target::File(file), keys, demo));
+                return Ok((Target::File(file), keys, demo, agent));
             }
             "--sync" => {
                 let ok = sync::sync_all(&home, &vaults::all(&home));
@@ -869,6 +1304,10 @@ fn cli(args: &[String]) -> Result<(Target, bool, bool), String> {
                 demo = true;
                 continue;
             }
+            flag if flag == "--agent" || flag.starts_with("--agent=") => {
+                agent = Some(flag.strip_prefix("--agent=").unwrap_or("").to_string());
+                continue;
+            }
             flag if flag.starts_with('-') && flag.len() > 1 => return Err(format!("unknown option {flag} — see omanote --help")),
             word => {
                 words.push(word.to_string());
@@ -878,12 +1317,29 @@ fn cli(args: &[String]) -> Result<(Target, bool, bool), String> {
         println!("{}", done.trim_end());
         std::process::exit(0);
     }
-    Ok((target(&words), keys, demo))
+    Ok((target(&words), keys, demo, agent))
 }
+
+/// A note made from an `@` mention: just its title, ready to be written in.
+/// An existing file is left alone.
+fn start_note(path: &std::path::Path) -> std::io::Result<()> {
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)?;
+    }
+    let title = path.file_stem().unwrap_or_default().to_string_lossy();
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(mut file) => file.write_all(format!("# {title}\n\n").as_bytes()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// How many notes back Alt+← remembers.
+const HISTORY: usize = 50;
 
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args_os().skip(1).map(|a| a.to_string_lossy().into_owned()).collect();
-    let (target, keys, demo) = cli(&args).unwrap_or_else(|msg| {
+    let (target, keys, demo, start_agent) = cli(&args).unwrap_or_else(|msg| {
         eprintln!("omanote: {msg}");
         std::process::exit(2);
     });
@@ -958,9 +1414,17 @@ fn main() -> std::io::Result<()> {
         hook(info);
     }));
 
+    // A closed window or a `kill` is a request to leave, not an execution:
+    // the note gets saved and nothing is left lying around.
+    stop_on_signals();
+    now::sweep(&vaults::home());
+
     let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
     let mut app = App {
         ed: Editor::new("", None),
+        other: None,
+        on_right: false,
+        other_area: None,
         picker,
         save_as: None,
         wanted,
@@ -975,6 +1439,14 @@ fn main() -> std::io::Result<()> {
         seen_saves: 0,
         toast: None,
         last_click: None,
+        mention: None,
+        now: None,
+        pane_agent: String::new(),
+        pane_dir: PathBuf::new(),
+        pane_inbox: None,
+        pane_vaults: Vec::new(),
+        history: Vec::new(),
+        forward: Vec::new(),
         enhanced_keys,
         image_mode: images::detect(),
         settings: config::Config::default(),
@@ -996,10 +1468,19 @@ fn main() -> std::io::Result<()> {
     if let Some(first) = problems.first() {
         app.say(format!("config.toml, {first}"));
     }
+    match start_agent.as_deref() {
+        Some("") => app.assistant(),
+        Some(name) if app.ed.path.is_some() => {
+            let found = agents::available(&app.settings.agents);
+            app.open_assistant(agents::named(name, &found));
+        }
+        Some(_) => app.assistant(),
+        None => {}
+    }
     let result = (|| -> std::io::Result<()> {
         let mut redraw = true;
         let mut drawn = Instant::now();
-        while !app.quit {
+        while !app.quit && !STOP.load(Ordering::Relaxed) {
             app.reap_pane();
             // The assistant prints whenever it likes, so with the pane open we
             // look often, but only draw when something actually changed.
@@ -1011,6 +1492,7 @@ fn main() -> std::io::Result<()> {
                     app.toast = None;
                 }
                 app.tick();
+                app.tell_agent();
                 let toast = app.toast.as_ref().map(|(msg, _)| msg.clone());
                 let syncing = app.ed.path.as_ref().and_then(|p| app.sync.state(p, &all_vaults));
                 let size = terminal.size()?;
@@ -1018,30 +1500,66 @@ fn main() -> std::io::Result<()> {
                     terminal.clear()?;
                 }
                 let full = ratatui::layout::Rect::new(0, 0, size.width, size.height);
-                let (note, pane_area) = ui::split(full, app.pane.is_some(), app.pane_focused);
-                app.pane_x = pane_area.map_or(u16::MAX, |r| r.x);
-                if let (Some(pane), Some(rect)) = (&mut app.pane, pane_area) {
+                let panes = ui::arrange(full, app.other.is_some(), app.pane.is_some(), app.pane_focused);
+                app.pane_x = panes.agent.map_or(u16::MAX, |r| r.x);
+                if let (Some(pane), Some(rect)) = (&mut app.pane, panes.agent) {
                     let screen = ui::pane_screen(rect);
                     pane.resize(screen.height, screen.width);
                     app.pane_screen = screen;
                 }
+                let (mine, theirs) = match (panes.right, app.on_right) {
+                    (Some(right), true) => (right, Some(panes.left)),
+                    (Some(right), false) => (panes.left, Some(right)),
+                    (None, _) => (panes.left, None),
+                };
+                app.other_area = theirs;
                 // Images have to be in the terminal before the frame that refers to them.
-                if let Some((x, y, w, h, table_w)) = ui::text_area(note, &app.settings).filter(|_| note.width > 0) {
-                    app.ed.table_w = table_w;
-                    app.ed.set_view(x, y, w, h);
-                    let pending = app.ed.images.take_outbox();
-                    if !pending.is_empty() {
-                        let mut out = stdout();
-                        out.write_all(&pending)?;
-                        out.flush()?;
+                let mut pending = Vec::new();
+                let shown = [(Some(&mut app.ed), Some(mine)), (app.other.as_mut().map(|o| &mut o.ed), theirs)];
+                for (ed, area) in shown {
+                    let (Some(ed), Some(area)) = (ed, area.filter(|a| a.width > 0)) else { continue };
+                    if let Some((x, y, w, h, table_w)) = ui::text_area(area, &app.settings) {
+                        ed.table_w = table_w;
+                        ed.set_view(x, y, w, h);
+                        pending.extend(ed.images.take_outbox());
                     }
                 }
-                let assistant = app.pane.as_ref().map(|p| (p, app.pane_focused));
-                terminal.draw(|f| ui::draw(f, &mut app.ed, app.picker.as_ref(), app.save_as.as_ref(), toast.as_deref(), syncing, &app.settings, app.enhanced_keys, assistant, app.chooser.as_ref()))?;
+                if !pending.is_empty() {
+                    let mut out = stdout();
+                    out.write_all(&pending)?;
+                    out.flush()?;
+                }
+                let back = app.history.iter().rev().find(|(p, _)| p.exists() && !app.is_other(p)).map(|(p, _)| p.file_name().unwrap_or_default().to_string_lossy().into_owned());
+                let place = |ed: &Editor| ed.path.as_ref().map(|p| vaults::place(p, &all_vaults)).unwrap_or_default();
+                let places = (place(&app.ed), app.other.as_ref().map(|o| place(&o.ed)).unwrap_or_default());
+                let scene = ui::Scene {
+                    panes: &panes,
+                    other: app.other.as_mut().map(|o| &mut o.ed),
+                    on_right: app.on_right,
+                    picker: app.picker.as_ref(),
+                    save_as: app.save_as.as_ref(),
+                    toast: toast.as_deref(),
+                    sync: syncing,
+                    config: &app.settings,
+                    assistant: app.pane.as_ref().map(|p| (p, app.pane_focused)),
+                    chooser: app.chooser.as_ref(),
+                    mention: app.mention.as_ref(),
+                    back: back.as_deref(),
+                    places: (&places.0, &places.1),
+                };
+                terminal.draw(|f| ui::draw(f, &mut app.ed, scene))?;
             }
 
             let wait = Duration::from_millis(if app.pane.is_some() { 25 } else { 250 });
-            if event::poll(wait)? {
+            let input = match watch_terminal(wait) {
+                Tty::Gone => {
+                    STOP.store(true, Ordering::Relaxed);
+                    break;
+                }
+                Tty::Look => event::poll(Duration::ZERO)?,
+                Tty::NotStdin => event::poll(wait)?,
+            };
+            if input {
                 // Drain everything pending so a burst of input costs one redraw.
                 loop {
                     app.handle(event::read()?);
@@ -1061,6 +1579,56 @@ fn main() -> std::io::Result<()> {
         Ok(())
     })();
 
+    // Told to stop (the terminal may already be gone, which is why the loop
+    // can also end in an error): nobody can be asked anything, so save what
+    // has a file and go.
+    if STOP.load(Ordering::Relaxed) {
+        app.leave();
+    }
     restore_terminal(enhanced_keys);
     result
+}
+
+enum Tty {
+    /// The window was closed under us.
+    Gone,
+    /// Input, a signal or just time passing: see what there is.
+    Look,
+    NotStdin,
+}
+
+/// Wait for input, but look at the terminal ourselves first. crossterm never
+/// returns from `poll` once the terminal has hung up (it reads "nothing" from
+/// it in a loop, forever), which would turn a closed window into a process
+/// spinning in the background with the note unsaved.
+fn watch_terminal(wait: Duration) -> Tty {
+    if unsafe { libc::isatty(0) } != 1 {
+        return Tty::NotStdin;
+    }
+    let mut stdin = libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 };
+    let ready = unsafe { libc::poll(&mut stdin, 1, wait.as_millis() as libc::c_int) };
+    let gone = ready > 0 && stdin.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0;
+    if gone { Tty::Gone } else { Tty::Look }
+}
+
+static STOP: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn stop(_: libc::c_int) {
+    STOP.store(true, Ordering::Relaxed);
+}
+
+fn stop_on_signals() {
+    for signal in [libc::SIGHUP, libc::SIGTERM] {
+        unsafe { libc::signal(signal, stop as extern "C" fn(libc::c_int) as libc::sighandler_t) };
+    }
+    // The way out above depends on the main loop coming round again. Should it
+    // ever be stuck when told to stop, do not linger: tidy up and go.
+    std::thread::spawn(|| {
+        while !STOP.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        std::thread::sleep(Duration::from_secs(3));
+        now::remove_own(&vaults::home());
+        std::process::exit(1);
+    });
 }
