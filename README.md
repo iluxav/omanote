@@ -6,6 +6,8 @@ A small markdown note editor for the terminal. Think *nano for markdown*: open i
 
 Markdown renders as you write. Headings, **bold**, links, checkboxes, tables and images show formatted, and the raw syntax only appears on the line you are editing.
 
+![omanote editing a note: a heading, an image, a task list and a table, all rendered in the terminal](assets/screenshot.png)
+
 ## Install
 
 ```sh
