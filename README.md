@@ -46,10 +46,11 @@ omanote --demo          # a note that shows everything off
 
 `omanote <name>` looks in the current folder and in every vault. Case and the `.md` do not matter, so `omanote readme` opens `README.md` and `omanote my ideas` opens `My Ideas.md`. One match opens straight away; with several you get the list (`Tab` to move, `Enter` to open); with none you get a new note, and `Ctrl+S` offers to save it under that name.
 
-Write first, name it later: on a new note `Ctrl+S` asks where to keep it (a vault, or the current folder), with the file name prefilled from your first line (`# Trip plan` → `trip-plan.md`). From then on notes save themselves as you type.
+Write first, name it later: on a new note `Ctrl+S` asks where to keep it (a vault, or the current folder), with the file name prefilled from your first line (`# Trip plan` → `trip-plan.md`). From then on notes save themselves as you type. A note that has no file yet is never dropped silently: quitting, `Ctrl+N` or opening another note asks where to save it first (or `Ctrl+D` to discard it).
 
 | Key | |
 | --- | --- |
+| `Ctrl+N` | start a new note |
 | `Ctrl+P` | find a note by fuzzy search, or create one |
 | `Ctrl+S` / `Ctrl+Q` | save / quit |
 | `F2` | move, rename or copy the note: another vault, another folder, another name |
@@ -91,7 +92,7 @@ Real images need a terminal with the Kitty graphics protocol (Ghostty, Kitty). O
 
 ## Settings
 
-`omanote --config` prints the path of the settings file (`~/.omanote/config.toml`), creating it with comments if it is not there yet:
+`omanote --config` opens the settings file (`~/.omanote/config.toml`) in omanote itself, creating it with comments the first time:
 
 ```toml
 width = 84          # widest the text column gets; 0 = the whole window
@@ -99,7 +100,11 @@ align = "center"    # where the column sits in a wide window: "left", "center", 
 margin = 2          # blank columns kept at the window's edges
 ```
 
-Changes apply the next time you start omanote. `Ctrl+L` repaints the screen if a terminal ever garbles it.
+Saving applies the settings straight away, with no restart. A line that makes no sense is reported and nothing changes. The footer and panels take their colours from your terminal's own background and foreground, so they follow its theme; `OMANOTE_COLORS=plain` turns that off. `Ctrl+L` repaints the screen if a terminal ever garbles it.
+
+### Files that are not markdown
+
+Markdown rendering is for new notes and `.md` / `.markdown` files. Anything else, such as the settings file, a script or a log, opens as plain text: nothing is hidden or restyled, tables and lists are not touched, and `Enter` just keeps the indentation. Comment lines in config files (`.toml`, `.conf`, `.yaml`, `.sh`, …) are shown quieter.
 
 ## Vaults
 

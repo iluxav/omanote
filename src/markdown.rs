@@ -20,6 +20,10 @@ pub enum Block {
     FenceOpen,
     FenceClose,
     Code,
+    /// A line of a file that is not markdown: shown exactly as it is.
+    Plain,
+    /// The same, for a `# comment` line of a config file: shown quieter.
+    Comment,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -240,6 +244,13 @@ pub fn style_line(chars: &[char], block: Block) -> StyledLine {
     };
 
     match block {
+        Block::Plain => return sl,
+        Block::Comment => {
+            for cell in &mut sl.cells {
+                cell.style = crate::theme::get().muted();
+            }
+            return sl;
+        }
         Block::Code => {
             sl.prefix = Some(("│ ", marker()));
             for cell in &mut sl.cells {

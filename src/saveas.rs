@@ -14,6 +14,8 @@ pub enum After {
     Stay,
     Quit,
     Open(PathBuf),
+    /// Ctrl+N: start a new, empty note.
+    New,
 }
 
 pub struct SaveAs {

@@ -63,6 +63,9 @@ pub struct Editor {
     pub embedded: (usize, usize),
     pub view: View,
     pub path: Option<PathBuf>,
+    /// Render and behave as markdown. Off for any file that is not `.md`: that
+    /// one is edited as the plain text it is.
+    pub markdown: bool,
     pub dirty: bool,
     /// How many times this note has been written, and the file's timestamp as
     /// we last knew it (to notice when something else changes it).
@@ -77,6 +80,26 @@ pub struct Editor {
     last_edit: Option<(Edit, Instant, Pos)>,
 }
 
+/// A note without a file yet, or a `.md` / `.markdown` file. Anything else
+/// (a config file, a script, a log) is plain text.
+pub fn is_markdown(path: Option<&std::path::Path>) -> bool {
+    match path.and_then(|p| p.extension()) {
+        Some(ext) => ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown"),
+        None => path.is_none(),
+    }
+}
+
+/// File types where a leading `#` starts a comment, worth showing quieter.
+fn has_hash_comments(path: Option<&std::path::Path>) -> bool {
+    let ext = path.and_then(|p| p.extension()).map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    ["toml", "conf", "ini", "yaml", "yml", "sh", "env", "cfg"].contains(&ext.as_str())
+}
+
+fn plain_blocks(lines: &[Vec<char>], comments: bool) -> Vec<Block> {
+    let comment = |l: &Vec<char>| comments && l.iter().find(|c| !c.is_whitespace()) == Some(&'#');
+    lines.iter().map(|l| if comment(l) { Block::Comment } else { Block::Plain }).collect()
+}
+
 fn is_word(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
@@ -86,7 +109,8 @@ impl Editor {
         let mut embeds = Vec::new();
         let mut lines: Vec<Vec<char>> = Vec::new();
         for line in text.split('\n').map(|l| l.trim_end_matches('\r')) {
-            match data_definition(line) {
+            // Embedded images are a markdown thing; a plain file keeps every line.
+            match data_definition(line).filter(|_| is_markdown(path.as_deref())) {
                 Some((label, uri)) => embeds.push((label, uri.to_string())),
                 None => lines.push(line.chars().collect()),
             }
@@ -101,7 +125,9 @@ impl Editor {
         if lines.is_empty() {
             lines.push(Vec::new());
         }
-        let blocks = classify(&lines);
+        let markdown = is_markdown(path.as_deref());
+        let comments = has_hash_comments(path.as_deref());
+        let blocks = if markdown { classify(&lines) } else { plain_blocks(&lines, comments) };
         let mut editor = Editor {
             lines,
             blocks,
@@ -116,6 +142,7 @@ impl Editor {
             view: View { w: 80, h: 24, ..View::default() },
             disk_mtime: path.as_ref().and_then(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok()),
             path,
+            markdown,
             dirty: false,
             save_count: 0,
             last_change: Instant::now(),
@@ -168,6 +195,17 @@ impl Editor {
         self.cursor = Pos { row: at + 1, col: 0 };
         self.edited(Edit::Other);
         label
+    }
+
+    fn classified(&self) -> Vec<Block> {
+        if self.markdown { classify(&self.lines) } else { plain_blocks(&self.lines, has_hash_comments(self.path.as_deref())) }
+    }
+
+    /// The note was given a (different) file: it is markdown or not by its new name.
+    pub fn renamed(&mut self) {
+        self.markdown = is_markdown(self.path.as_deref());
+        self.blocks = self.classified();
+        self.images.mark_stale();
     }
 
     pub fn with_images(mut self, images: Images) -> Self {
@@ -498,7 +536,9 @@ impl Editor {
             self.goal_x = None;
         }
         self.view = View { x, y, w, h, rows: Vec::new() };
-        self.images.prepare(&self.lines, &self.embeds, w, (h * 3 / 5).max(4));
+        if self.markdown {
+            self.images.prepare(&self.lines, &self.embeds, w, (h * 3 / 5).max(4));
+        }
         self.top = self.top.min(self.lines.len() - 1);
         self.top_skip = self.top_skip.min(self.rows(self.top, self.is_revealed(self.top)).len() - 1);
         if !self.follow {
@@ -583,7 +623,7 @@ impl Editor {
     }
 
     fn edited(&mut self, kind: Edit) {
-        self.blocks = classify(&self.lines);
+        self.blocks = self.classified();
         self.images.mark_stale();
         self.count_embeds();
         self.dirty = true;
@@ -761,9 +801,15 @@ impl Editor {
     pub fn enter(&mut self) {
         self.checkpoint(Edit::Other);
         if self.remove_selection() {
-            self.blocks = classify(&self.lines);
+            self.blocks = self.classified();
         }
         let Pos { row, col } = self.cursor;
+        if !self.markdown {
+            // Plain text: a new line that keeps the indentation, nothing cleverer.
+            let indent: String = self.lines[row].iter().take_while(|c| **c == ' ' || **c == '\t').take(col).collect();
+            self.insert_raw(&format!("\n{indent}"));
+            return self.edited(Edit::Other);
+        }
         if self.enter_in_table(row, col) {
             return self.edited(Edit::Other);
         }
@@ -800,7 +846,7 @@ impl Editor {
     fn insert_table_row(&mut self, at: usize, like: usize, columns: usize) {
         let row = table::empty_row(&self.lines[like], columns);
         self.lines.insert(at, row);
-        self.blocks = classify(&self.lines);
+        self.blocks = self.classified();
         self.goto_cell(at, 0);
     }
 
@@ -882,7 +928,7 @@ impl Editor {
         for r in start..end {
             self.lines[r] = table::add_column(&self.lines[r], k, after, r == start + 1);
         }
-        self.blocks = classify(&self.lines);
+        self.blocks = self.classified();
         self.goto_cell(row, if after { k + 1 } else { k });
         self.edited(Edit::Other);
         true
@@ -919,7 +965,7 @@ impl Editor {
             return;
         }
         let row = self.cursor.row;
-        if self.selection().is_none() && continuation(&self.lines[row]).is_some() {
+        if self.markdown && self.selection().is_none() && continuation(&self.lines[row]).is_some() {
             self.checkpoint(Edit::Other);
             self.lines[row].splice(0..0, [' ', ' ']);
             self.cursor.col += 2;
@@ -1342,6 +1388,38 @@ mod tests {
         assert_eq!(e.paste_image(PIXEL.into()), "img2", "img1 is taken");
         assert_eq!(e.text().matches("data:image/png").count(), 2);
         assert_eq!(ed(&e.text()).text(), e.text(), "saving and reopening changes nothing");
+    }
+
+    #[test]
+    fn files_that_are_not_markdown_are_plain_text() {
+        let toml = "# settings\nwidth = 84   # **not bold**\n- [ ] not a task\n| a | b |\n|---|---|\n[img1]: data:image/png;base64,AAAA\n";
+        let mut e = Editor::new(toml, Some("/tmp/config.toml".into()));
+        assert!(!e.markdown);
+        assert_eq!(e.blocks[..2], [Block::Comment, Block::Plain]);
+        assert!(e.blocks[2..].iter().all(|b| *b == Block::Plain), "no tables, no tasks");
+        assert_eq!(e.text(), toml, "every line survives, including one that looks like an embedded image");
+        // Nothing is hidden or replaced, whether the cursor is on the line or not.
+        let shown: String = e.rows(1, false)[0].cells.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(shown, "width = 84   # **not bold**");
+        assert_eq!(e.rows(3, false).len(), 1, "no table borders");
+
+        // Enter keeps the indentation and does not continue "lists".
+        e.move_to(Pos { row: 2, col: 16 }, false);
+        e.enter();
+        assert_eq!(e.lines[3], Vec::<char>::new());
+        let mut e = Editor::new("    indented", Some("/tmp/x.conf".into()));
+        e.doc_end(false);
+        e.enter();
+        assert_eq!(e.text(), "    indented\n    \n");
+
+        // What counts as markdown.
+        assert!(is_markdown(None) && is_markdown(Some("a/B.MD".as_ref())) && is_markdown(Some("x.markdown".as_ref())));
+        assert!(!is_markdown(Some("notes.txt".as_ref())) && !is_markdown(Some("Makefile".as_ref())));
+        // A new note that gets saved under a plain name stops being markdown, and the reverse.
+        let mut e = ed("# Title");
+        e.path = Some("/tmp/title.txt".into());
+        e.renamed();
+        assert!(!e.markdown && e.blocks == [Block::Plain]);
     }
 
     #[test]

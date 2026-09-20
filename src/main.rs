@@ -9,6 +9,7 @@ mod picker;
 mod saveas;
 mod sync;
 mod table;
+mod theme;
 mod ui;
 mod vaults;
 
@@ -58,6 +59,7 @@ struct App {
     last_click: Option<(Instant, Pos)>,
     enhanced_keys: bool,
     image_mode: images::Mode,
+    settings: config::Config,
     /// Redraw every cell on the next frame, not just what changed.
     repaint: bool,
     /// `--keys`: show and log every key event, for diagnosing terminal quirks.
@@ -70,9 +72,35 @@ impl App {
         self.toast = Some((msg.into(), Instant::now()));
     }
 
+    /// The settings file was just saved from inside the editor: use it right away.
+    /// A half-typed line during autosave changes nothing and says nothing; an
+    /// explicit save reports what is wrong.
+    fn settings_saved(&mut self, explicit: bool) {
+        let file = config::path(&vaults::home());
+        let same = |a: &std::path::Path, b: &std::path::Path| a.canonicalize().ok().zip(b.canonicalize().ok()).is_some_and(|(a, b)| a == b);
+        if !self.ed.path.as_deref().is_some_and(|p| same(p, &file)) {
+            return;
+        }
+        let (settings, problems) = config::load(&vaults::home());
+        match (problems.first(), explicit) {
+            (None, _) => {
+                self.settings = settings;
+                self.repaint = true;
+                if explicit {
+                    self.say("Settings applied");
+                }
+            }
+            (Some(problem), true) => self.say(format!("Not applied — {problem}")),
+            (Some(_), false) => {}
+        }
+    }
+
     fn save(&mut self) {
         match self.ed.save() {
-            Ok(true) => self.say("Saved"),
+            Ok(true) => {
+                self.say("Saved");
+                self.settings_saved(true);
+            }
             Ok(false) => self.ask_where(After::Stay),
             Err(e) => self.say(format!("Could not save: {e}")),
         }
@@ -121,6 +149,7 @@ impl App {
 
     fn ask_where(&mut self, after: After) {
         self.picker = None;
+        self.toast = None;
         let here = std::env::current_dir().ok();
         self.save_as = Some(SaveAs::new(&self.ed.lines, vaults::all(&vaults::home()), here, self.wanted.as_deref(), after));
     }
@@ -138,6 +167,7 @@ impl App {
             After::Stay => {}
             After::Quit => self.quit(),
             After::Open(path) => self.open(path),
+            After::New => self.new_note(),
         }
     }
 
@@ -198,6 +228,7 @@ impl App {
             return self.say(format!("Could not save there: {e}"));
         }
         self.ed.images.set_note(&path, vault);
+        self.ed.renamed();
         let mut done = format!("Saved to {}", vaults::tilde(&path));
         if let Some(old) = from {
             done = format!("Copied to {} — now editing the copy", vaults::tilde(&path));
@@ -214,6 +245,27 @@ impl App {
         self.say(done);
         let after = self.save_as.take().map(|p| p.after).unwrap_or(After::Stay);
         self.carry_on(after);
+    }
+
+    /// Ctrl+N: a fresh, empty note. What was open is saved first; if it has no
+    /// file yet and there is text in it, the save prompt comes up instead and
+    /// the new note follows once that is settled.
+    fn new_note(&mut self) {
+        if self.unsaved_draft() {
+            return self.ask_where(After::New);
+        }
+        if self.ed.dirty && self.ed.path.is_some() {
+            if let Err(e) = self.ed.save() {
+                return self.say(format!("Could not save, staying here: {e}"));
+            }
+        }
+        self.note_saves();
+        self.sync.flush();
+        self.picker = None;
+        self.wanted = None;
+        self.ed = self.editor("", None);
+        self.seen_saves = 0;
+        self.say("New note — Ctrl+S to choose where it goes");
     }
 
     /// Switch to another note, saving the current one first.
@@ -328,6 +380,7 @@ impl App {
                 }
                 'y' => self.redo(),
                 'a' => ed.select_all(),
+                'n' => self.new_note(),
                 'l' => self.repaint = true,
                 'c' => {
                     clipboard::copy(&ed.copy());
@@ -335,7 +388,8 @@ impl App {
                 }
                 'x' => clipboard::copy(&ed.cut()),
                 'v' => match clipboard::image() {
-                    Some((mime, bytes)) => match images::embeddable(&mime, bytes, PASTE_MAX_WIDTH) {
+                    Some(_) if !ed.markdown => self.say("Images can be pasted into markdown notes only"),
+                Some((mime, bytes)) => match images::embeddable(&mime, bytes, PASTE_MAX_WIDTH) {
                         Ok(uri) => {
                             let size = uri.len();
                             let label = ed.paste_image(uri);
@@ -348,6 +402,7 @@ impl App {
                         ed.insert_str(&text);
                     }
                 },
+                'b' | 'i' | 't' if !ed.markdown => self.say("That is a markdown shortcut; this file is plain text"),
                 'b' => self.wrap("**"),
                 'i' => self.wrap("*"),
                 't' => ed.toggle_task(ed.cursor.row),
@@ -513,6 +568,7 @@ omanote — a small markdown note editor
                               none starts a new note. Case and .md do not matter.
   omanote <path/to/file.md>   open (or start) that file
   omanote --demo              a note that shows off what the editor renders
+  Ctrl+N inside the editor    start a new note (asks to save an unnamed one first)
   Ctrl+P inside the editor    fuzzy-find a note in any vault
   F2 inside the editor        move, rename or copy the note (another vault, another folder)
 
@@ -523,8 +579,8 @@ Vaults (where Ctrl+P looks; new notes go in ~/.omanote/docs):
   omanote --vls               list vaults
   omanote --sync              sync every GitHub vault now: pull, then push
 
-  omanote --config            where the settings file is (creates it), and what it says:
-                              text width, left/center/right, margins
+  omanote --config            edit the settings (text width, left/center/right, margins);
+                              saving applies them straight away
   Ctrl+L inside the editor    repaint the screen
 
   --keys                      show every key event (for diagnosing a terminal)
@@ -568,14 +624,9 @@ fn cli(args: &[String]) -> Result<(Target, bool, bool), String> {
             "--vlrm" => vaults::remove(&home, &value("the vault to remove")?)?,
             "--vls" => vaults::list(&home),
             "--config" => {
+                // Open the settings in the editor itself; saving applies them.
                 let file = config::ensure(&home).map_err(|e| format!("cannot write the config: {e}"))?;
-                let (now, problems) = config::load(&home);
-                let align = format!("{:?}", now.align).to_lowercase();
-                let mut out = format!("{}\n\n  width = {}\n  align = \"{align}\"\n  margin = {}\n", vaults::tilde(&file), now.width, now.margin);
-                for problem in problems {
-                    out.push_str(&format!("\n  ! {problem}"));
-                }
-                out
+                return Ok((Target::File(file), keys, demo));
             }
             "--sync" => {
                 let ok = sync::sync_all(&home, &vaults::all(&home));
@@ -661,6 +712,8 @@ fn main() -> std::io::Result<()> {
     };
 
     enable_raw_mode()?;
+    // First thing on the wire: its answer must not be mistaken for typing later.
+    theme::init(theme::detect());
     let enhanced_keys = supports_keyboard_enhancement().unwrap_or(false);
     let mut out = stdout();
     execute!(out, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste, EnableFocusChange, SetCursorStyle::SteadyBar)?;
@@ -685,6 +738,7 @@ fn main() -> std::io::Result<()> {
         last_click: None,
         enhanced_keys,
         image_mode: images::detect(),
+        settings: config::Config::default(),
         repaint: false,
         key_log,
         quit: false,
@@ -699,6 +753,7 @@ fn main() -> std::io::Result<()> {
 
     let all_vaults = vaults::all(&vaults::home());
     let (settings, problems) = config::load(&vaults::home());
+    app.settings = settings;
     if let Some(first) = problems.first() {
         app.say(format!("config.toml, {first}"));
     }
@@ -715,7 +770,7 @@ fn main() -> std::io::Result<()> {
             if std::mem::take(&mut app.repaint) {
                 terminal.clear()?;
             }
-            if let Some((x, y, w, h, table_w)) = ui::text_area(ratatui::layout::Rect::new(0, 0, size.width, size.height), &settings) {
+            if let Some((x, y, w, h, table_w)) = ui::text_area(ratatui::layout::Rect::new(0, 0, size.width, size.height), &app.settings) {
                 app.ed.table_w = table_w;
                 app.ed.set_view(x, y, w, h);
                 let pending = app.ed.images.take_outbox();
@@ -725,7 +780,7 @@ fn main() -> std::io::Result<()> {
                     out.flush()?;
                 }
             }
-            terminal.draw(|f| ui::draw(f, &mut app.ed, app.picker.as_ref(), app.save_as.as_ref(), toast.as_deref(), syncing, &settings, app.enhanced_keys))?;
+            terminal.draw(|f| ui::draw(f, &mut app.ed, app.picker.as_ref(), app.save_as.as_ref(), toast.as_deref(), syncing, &app.settings, app.enhanced_keys))?;
 
             if event::poll(Duration::from_millis(250))? {
                 // Drain everything pending so a burst of input costs one redraw.
@@ -736,8 +791,9 @@ fn main() -> std::io::Result<()> {
                     }
                 }
             } else if app.ed.dirty && app.ed.path.is_some() && app.ed.last_change.elapsed() > AUTOSAVE_IDLE {
-                if let Err(e) = app.ed.save() {
-                    app.say(format!("Could not save: {e}"));
+                match app.ed.save() {
+                    Ok(_) => app.settings_saved(false),
+                    Err(e) => app.say(format!("Could not save: {e}")),
                 }
             }
         }

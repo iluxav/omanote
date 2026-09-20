@@ -4,13 +4,14 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Clear, Paragraph};
+use ratatui::widgets::{Block, Clear, Paragraph};
 
 use crate::config::{Align, Config};
 use crate::editor::{Editor, Pos};
 use crate::layout::{VRow, locate};
 use crate::picker::{Picker, Row, age};
 use crate::saveas::{After, SaveAs};
+use crate::theme;
 use crate::vaults::tilde;
 
 const PICKER_ROWS: usize = 8;
@@ -30,7 +31,8 @@ pub fn text_area(area: Rect, config: &Config) -> Option<(u16, u16, u16, u16, u16
         Align::Center => (area.width - w) / 2,
         Align::Right => area.width - margin - w,
     };
-    Some((x, 1, w, area.height - 3, area.width - margin - x))
+    // Rows: 1 blank on top, the text, 1 to breathe, status, hints.
+    Some((x, 1, w, area.height - 4, area.width - margin - x))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -74,7 +76,7 @@ pub fn draw(
     ed.view.rows = map;
 
     if ed.lines.len() == 1 && ed.lines[0].is_empty() {
-        out[0] = Line::styled("Start writing…", Style::new().fg(Color::DarkGray));
+        out[0] = Line::styled("Start writing…", theme::get().muted());
     }
 
     f.render_widget(Paragraph::new(out), Rect::new(x, 1, area.width - x, h));
@@ -82,16 +84,23 @@ pub fn draw(
         f.set_cursor_position(xy);
     }
 
+    // The footer: a band across the whole window, set apart from the page.
+    let look = theme::get();
+    f.render_widget(Block::new().style(look.surface()), Rect::new(0, area.height - 2, area.width, 2));
+    if !look.rich {
+        let rule = Line::styled("─".repeat(w as usize), look.faint());
+        f.render_widget(Paragraph::new(rule), Rect::new(x, area.height - 3, w, 1));
+    }
     draw_status(f, ed, toast, sync, Rect::new(x, area.height - 2, w, 1));
     let hints = match (save_as, picker) {
-        (Some(p), _) if p.moving.is_some() && p.keep_original => Some(vec![("Enter", "Copy"), ("^K", "Move instead"), ("↑↓", "Where"), ("Esc", "Cancel")]),
-        (Some(p), _) if p.moving.is_some() => Some(vec![("Enter", "Move"), ("^K", "Copy instead"), ("↑↓", "Where"), ("Esc", "Cancel")]),
-        (Some(p), _) if matches!(p.after, After::Stay) => Some(vec![("Enter", "Save"), ("↑↓", "Vault"), ("Esc", "Cancel")]),
-        (Some(_), _) => Some(vec![("Enter", "Save"), ("↑↓", "Vault"), ("^D", "Discard"), ("Esc", "Cancel")]),
-        (None, Some(_)) => Some(vec![("↑↓", "Select"), ("Enter", "Open"), ("Esc", "Cancel"), ("^U", "Clear")]),
+        (Some(p), _) if p.moving.is_some() && p.keep_original => Some(vec![("Enter", "copy"), ("^K", "move instead"), ("↑↓", "where"), ("Esc", "cancel")]),
+        (Some(p), _) if p.moving.is_some() => Some(vec![("Enter", "move"), ("^K", "copy instead"), ("↑↓", "where"), ("Esc", "cancel")]),
+        (Some(p), _) if matches!(p.after, After::Stay) => Some(vec![("Enter", "save"), ("↑↓", "vault"), ("Esc", "cancel")]),
+        (Some(_), _) => Some(vec![("Enter", "save"), ("↑↓", "vault"), ("^D", "discard"), ("Esc", "cancel")]),
+        (None, Some(_)) => Some(vec![("↑↓", "select"), ("Enter", "open"), ("Esc", "cancel"), ("^U", "clear")]),
         (None, None) => None,
     };
-    draw_hints(f, hints, enhanced_keys, Rect::new(x, area.height - 1, w, 1));
+    draw_hints(f, hints, enhanced_keys && ed.markdown, ed.markdown, Rect::new(x, area.height - 1, w, 1));
     if let Some(prompt) = save_as {
         draw_save_as(f, prompt, toast, x, w, area.height - 1);
     } else if let Some(picker) = picker {
@@ -99,38 +108,81 @@ pub fn draw(
     }
 }
 
+/// A drawer rising from the hint bar, on the same surface as the footer so the
+/// two read as one piece. Returns where its contents go.
+fn drawer(f: &mut Frame, title: &str, note: &str, x: u16, w: u16, bottom: u16, rows: u16) -> Rect {
+    let look = theme::get();
+    let h = rows + 1;
+    let y = bottom.saturating_sub(h);
+    let full = Rect::new(0, y, f.area().width, h);
+    f.render_widget(Clear, full);
+    f.render_widget(Block::new().style(look.surface()), full);
+
+    // ── Title ─────────────────────────────── note ──
+    let note = if note.is_empty() { String::new() } else { format!(" {note} ") };
+    let used = title.chars().count() + note.chars().count() + 6;
+    let rule = "─".repeat((w as usize).saturating_sub(used));
+    let head = Line::from(vec![
+        Span::styled("── ", look.faint()),
+        Span::styled(title.to_string(), Style::new().add_modifier(Modifier::BOLD)),
+        Span::styled(format!(" {rule}"), look.faint()),
+        Span::styled(note, look.muted()),
+        Span::styled("──", look.faint()),
+    ]);
+    f.render_widget(Paragraph::new(head).style(look.surface()), Rect::new(x, y, w, 1));
+    Rect::new(x, y + 1, w, rows)
+}
+
+/// One row of a drawer list: marker, text, and a quiet note at the right edge.
+fn list_row(selected: bool, mut text: Vec<Span<'static>>, note: String, w: u16) -> Line<'static> {
+    let look = theme::get();
+    // On a reversed (fallback) selection, dimmed text would vanish: keep it plain.
+    let pick = |style: Style| match (selected, look.rich) {
+        (false, _) => style,
+        (true, true) => style.patch(look.raised()),
+        (true, false) => Style::new().add_modifier(style.add_modifier).patch(look.raised()),
+    };
+    let marker = if selected { Span::styled(" ▸ ", pick(Style::new().fg(Color::Magenta))) } else { Span::raw("   ") };
+    for span in &mut text {
+        span.style = pick(span.style);
+    }
+    let used: usize = 3 + text.iter().map(|s| s.content.chars().count()).sum::<usize>();
+    let fill = (w as usize).saturating_sub(used + note.chars().count() + 1);
+    let mut spans = vec![marker];
+    spans.extend(text);
+    spans.push(Span::styled(" ".repeat(fill), pick(Style::default())));
+    spans.push(Span::styled(format!("{note} "), pick(look.muted())));
+    Line::from(spans)
+}
+
 /// Same place and shape as the picker: title rule, the name being typed, the vaults.
 fn draw_save_as(f: &mut Frame, p: &SaveAs, toast: Option<&str>, x: u16, w: u16, bottom: u16) {
-    let dim = Style::new().fg(Color::DarkGray);
-    let shown = p.vaults.len().clamp(1, PICKER_ROWS).min(bottom.saturating_sub(4) as usize);
-    let h = shown as u16 + 3;
-    let area = Rect::new(x, bottom - h, w, h);
-    f.render_widget(Clear, Rect::new(0, area.y, f.area().width, h));
-
+    let look = theme::get();
+    let shown = p.vaults.len().clamp(1, PICKER_ROWS).min(bottom.saturating_sub(5) as usize);
     let title = match p.after {
-        After::Stay if p.moving.is_some() && p.keep_original => "── Copy note · the original stays ",
-        After::Stay if p.moving.is_some() => "── Move note ",
-        After::Stay => "── Save note ",
-        After::Quit => "── Save before quitting? ",
-        After::Open(_) => "── Save this note first? ",
+        After::Stay if p.moving.is_some() && p.keep_original => "Copy note",
+        After::Stay if p.moving.is_some() => "Move note",
+        After::Stay => "Save note",
+        After::Quit => "Save before quitting?",
+        After::Open(_) | After::New => "Save this note first?",
     };
-    let label = "  Name › ";
+    let note = if p.moving.is_some() && p.keep_original { "the original stays" } else { "" };
+    let area = drawer(f, title, note, x, w, bottom, shown as u16 + 2);
+
+    let label = "   Name  ";
     let mut lines = vec![
-        Line::styled(format!("{title}{}", "─".repeat((w as usize).saturating_sub(title.chars().count()))), dim),
-        Line::from(vec![Span::styled(label, Style::new().fg(Color::Magenta)), Span::raw(p.name.clone()), Span::styled(format!(".{}", p.ext), dim)]),
+        Line::from(vec![Span::styled(label, look.muted()), Span::raw(p.name.clone()), Span::styled(format!(".{}", p.ext), look.muted())]),
         match toast {
-            Some(msg) => Line::styled(format!("  {msg}"), Style::new().fg(Color::Yellow)),
-            None => Line::styled(if p.moving.is_some() { "  To" } else { "  Vault" }, dim),
+            Some(msg) => Line::styled(format!("   {msg}"), Style::new().fg(Color::Yellow)),
+            None => Line::styled(if p.moving.is_some() { "   To" } else { "   In" }, look.muted()),
         },
     ];
     let first = p.selected.saturating_sub(shown - 1);
     for (i, vault) in p.vaults.iter().enumerate().skip(first).take(shown) {
-        let selected = i == p.selected;
-        let pick = |style: Style| if selected { style.add_modifier(Modifier::REVERSED) } else { style };
         let kind = match (&vault.github, i) {
             _ if p.stays == Some(i) => "where it is now".to_string(),
             _ if p.here == Some(i) => "current folder".to_string(),
-            (Some(repo), _) => format!("github: {repo}"),
+            (Some(repo), _) => format!("github · {repo}"),
             (None, 0) => "default".to_string(),
             (None, _) => String::new(),
         };
@@ -139,78 +191,66 @@ fn draw_save_as(f: &mut Frame, p: &SaveAs, toast: Option<&str>, x: u16, w: u16, 
         let path = tilde(&vault.path);
         let count = path.chars().count();
         let path = if count > room { format!("…{}", path.chars().skip(count - room + 1).collect::<String>()) } else { path };
-        let left = format!("{}{path}", if selected { " ▸ " } else { "   " });
-        let fill = (w as usize).saturating_sub(left.chars().count() + kind.chars().count() + 1);
-        lines.push(Line::from(vec![
-            Span::styled(left, pick(Style::default())),
-            Span::styled(" ".repeat(fill), pick(Style::default())),
-            Span::styled(format!("{kind} "), pick(dim)),
-        ]));
+        lines.push(list_row(i == p.selected, vec![Span::raw(path)], kind, w));
     }
-    f.render_widget(Paragraph::new(lines), area);
+    f.render_widget(Paragraph::new(lines).style(look.surface()), area);
     let cx = x + label.chars().count() as u16 + unicode_width::UnicodeWidthStr::width(p.name.as_str()) as u16;
-    f.set_cursor_position((cx.min(x + w - 1), area.y + 1));
+    f.set_cursor_position((cx.min(x + w - 1), area.y));
 }
 
-/// A panel growing up from the hint bar: title rule, query line, results.
+/// The note finder: what you typed, then the matches.
 fn draw_picker(f: &mut Frame, p: &Picker, x: u16, w: u16, bottom: u16) {
-    let dim = Style::new().fg(Color::DarkGray);
-    let shown = p.len().clamp(1, PICKER_ROWS).min(bottom.saturating_sub(3) as usize);
-    let h = shown as u16 + 2;
-    let area = Rect::new(x, bottom - h, w, h);
-    f.render_widget(Clear, Rect::new(0, area.y, f.area().width, h));
-
-    let root = p.title();
+    let look = theme::get();
+    let shown = p.len().clamp(1, PICKER_ROWS).min(bottom.saturating_sub(4) as usize);
+    let notes = match p.total() {
+        1 => "1 note".to_string(),
+        n => format!("{n} notes"),
+    };
     // A long vault path loses its front, not the note count.
-    let room = (w as usize).saturating_sub(24).max(8);
-    let count = root.chars().count();
-    let root = if count > room { format!("…{}", root.chars().skip(count - room + 1).collect::<String>()) } else { root };
-    let title = format!("── Notes · {root} · {} ", p.total());
-    let rule = "─".repeat((w as usize).saturating_sub(title.chars().count()));
-    let mut lines = vec![
-        Line::styled(format!("{title}{rule}"), dim),
-        Line::from(vec![Span::styled("› ", Style::new().fg(Color::Magenta)), Span::raw(p.query.clone())]),
-    ];
+    let room = (w as usize).saturating_sub(notes.chars().count() + 24).max(8);
+    let place = p.title();
+    let count = place.chars().count();
+    let place = if count > room { format!("…{}", place.chars().skip(count - room + 1).collect::<String>()) } else { place };
+    let area = drawer(f, "Open note", &format!("{place} · {notes}"), x, w, bottom, shown as u16 + 1);
+
+    let prompt = " ›  ";
+    let mut lines = vec![Line::from(vec![Span::styled(prompt, Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD)), Span::raw(p.query.clone())])];
 
     // Keep the selection inside the window of visible rows.
     let first = p.selected.saturating_sub(shown - 1);
     for i in first..first + shown {
-        let selected = i == p.selected;
-        let pick = |style: Style| if selected { style.add_modifier(Modifier::REVERSED) } else { style };
-        let mut spans = vec![Span::styled(if selected { " ▸ " } else { "   " }, pick(Style::default()))];
-        let mut right = String::new();
-        match p.row(i) {
+        let (text, note) = match p.row(i) {
             Some(Row::Note(note, hits)) => {
+                // The folder part is quiet, the name is not, what matched stands out.
                 let name_start = note.name.iter().rposition(|c| *c == '/').map_or(0, |k| k + 1);
-                for (k, c) in note.name.iter().enumerate() {
-                    let style = if hits.contains(&k) {
-                        Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-                    } else if k < name_start {
-                        dim
-                    } else {
-                        Style::default()
-                    };
-                    spans.push(Span::styled(c.to_string(), pick(style)));
-                }
-                right = age(note.modified);
+                let spans = note
+                    .name
+                    .iter()
+                    .enumerate()
+                    .map(|(k, c)| {
+                        let style = if hits.contains(&k) {
+                            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                        } else if k < name_start {
+                            look.muted()
+                        } else {
+                            Style::default()
+                        };
+                        Span::styled(c.to_string(), style)
+                    })
+                    .collect();
+                (spans, age(note.modified))
             }
-            Some(Row::Create(name)) => {
-                spans.push(Span::styled(format!("+ Create “{name}”"), pick(Style::new().fg(Color::Green))));
-            }
+            Some(Row::Create(name)) => (vec![Span::styled(format!("+ New note “{name}”"), Style::new().fg(Color::Green))], String::new()),
             None => {
-                let msg = if p.total() == 0 { "No notes here yet — type a name and press Enter" } else { "No matches" };
-                spans.push(Span::styled(msg, dim));
+                let msg = if p.total() == 0 { "No notes yet — type a name and press Enter" } else { "Nothing matches" };
+                (vec![Span::styled(msg, look.muted())], String::new())
             }
-        }
-        let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-        let fill = (w as usize).saturating_sub(used + right.chars().count() + 1);
-        spans.push(Span::styled(" ".repeat(fill), pick(Style::default())));
-        spans.push(Span::styled(format!("{right} "), pick(dim)));
-        lines.push(Line::from(spans));
+        };
+        lines.push(list_row(i == p.selected && p.row(i).is_some(), text, note, w));
     }
-    f.render_widget(Paragraph::new(lines), area);
-    let cx = x + 2 + unicode_width::UnicodeWidthStr::width(p.query.as_str()) as u16;
-    f.set_cursor_position((cx.min(x + w - 1), area.y + 1));
+    f.render_widget(Paragraph::new(lines).style(look.surface()), area);
+    let cx = x + prompt.chars().count() as u16 + unicode_width::UnicodeWidthStr::width(p.query.as_str()) as u16;
+    f.set_cursor_position((cx.min(x + w - 1), area.y));
 }
 
 fn render_row(vr: &VRow, row: usize, line_len: usize, sel: Option<(Pos, Pos)>) -> Line<'static> {
@@ -245,7 +285,7 @@ pub fn human(bytes: usize) -> String {
 }
 
 fn draw_status(f: &mut Frame, ed: &Editor, toast: Option<&str>, sync: Option<&str>, area: Rect) {
-    let dim = Style::new().fg(Color::DarkGray);
+    let look = theme::get();
     let name = match &ed.path {
         Some(p) => p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned()),
         None => "untitled".to_string(),
@@ -254,44 +294,67 @@ fn draw_status(f: &mut Frame, ed: &Editor, toast: Option<&str>, sync: Option<&st
         Some(msg) => Line::from(Span::styled(msg.to_string(), Style::new().fg(Color::Yellow))),
         None => Line::from(vec![
             Span::styled(name, Style::new().add_modifier(Modifier::BOLD)),
-            Span::styled(if ed.dirty { "  ● unsaved" } else { "" }, dim),
+            Span::styled(if ed.dirty { "  ● unsaved" } else { "" }, Style::new().fg(Color::Yellow)),
         ]),
     };
-    let images = match ed.embedded {
-        (0, _) => String::new(),
-        (1, bytes) => format!("1 image, {}  ·  ", human(bytes)),
-        (n, bytes) => format!("{n} images, {}  ·  ", human(bytes)),
-    };
-    let sync = sync.map(|s| format!("⇅ {s}  ·  ")).unwrap_or_default();
-    let right = format!("{sync}{images}Ln {}, Col {}  ·  {} words", ed.cursor.row + 1, ed.cursor.col + 1, ed.word_count());
-    let crowded = toast.is_some_and(|t| t.chars().count() + right.chars().count() + 2 > area.width as usize);
-    f.render_widget(Paragraph::new(left), area);
+
+    // Right side: quiet facts, with the one that may need attention in colour.
+    let gap = || Span::styled("   ", look.muted());
+    let mut right: Vec<Span> = Vec::new();
+    if let Some(state) = sync {
+        let style = match state {
+            "to sync" => Style::new().fg(Color::Yellow),
+            "syncing…" => Style::new().fg(Color::Blue),
+            _ => look.muted(),
+        };
+        right.extend([Span::styled(format!("⇅ {state}"), style), gap()]);
+    }
+    match ed.embedded {
+        (0, _) => {}
+        (1, bytes) => right.extend([Span::styled(format!("1 image, {}", human(bytes)), look.muted()), gap()]),
+        (n, bytes) => right.extend([Span::styled(format!("{n} images, {}", human(bytes)), look.muted()), gap()]),
+    }
+    if !ed.markdown {
+        right.extend([Span::styled("plain text", look.muted()), gap()]);
+    }
+    right.push(Span::styled(format!("Ln {}, Col {}", ed.cursor.row + 1, ed.cursor.col + 1), look.muted()));
+    right.extend([gap(), Span::styled(format!("{} words", ed.word_count()), look.muted())]);
+
+    let right_w: usize = right.iter().map(|s| s.content.chars().count()).sum();
+    let crowded = toast.is_some_and(|t| t.chars().count() + right_w + 2 > area.width as usize);
+    f.render_widget(Paragraph::new(left).style(look.surface()), area);
     if !crowded {
-        f.render_widget(Paragraph::new(Line::styled(right, dim)).right_aligned(), area);
+        let at = Rect::new(area.x + area.width.saturating_sub(right_w as u16), area.y, (right_w as u16).min(area.width), 1);
+        f.render_widget(Paragraph::new(Line::from(right)).style(look.surface()), at);
     }
 }
 
-fn draw_hints(f: &mut Frame, modal: Option<Vec<(&'static str, &'static str)>>, enhanced_keys: bool, area: Rect) {
-    let mut hints = vec![("^Q", "Quit"), ("^P", "Open"), ("^S", "Save"), ("^Z", "Undo"), ("^Y", "Redo"), ("^C", "Copy"), ("^X", "Cut"), ("^V", "Paste"), ("^B", "Bold")];
-    if enhanced_keys {
+fn draw_hints(f: &mut Frame, modal: Option<Vec<(&'static str, &'static str)>>, italic: bool, markdown: bool, area: Rect) {
+    let look = theme::get();
+    let mut hints = vec![("^Q", "quit"), ("^N", "new"), ("^P", "open"), ("^S", "save"), ("F2", "move"), ("^Z", "undo"), ("^Y", "redo"), ("^C", "copy"), ("^X", "cut"), ("^V", "paste")];
+    if markdown {
+        hints.push(("^B", "bold"));
         // Without the kitty keyboard protocol Ctrl+I is indistinguishable from Tab.
-        hints.push(("^I", "Italic"));
+        if italic {
+            hints.push(("^I", "italic"));
+        }
+        hints.push(("^T", "task"));
     }
-    hints.push(("^T", "Task"));
-    hints.insert(3, ("F2", "Move"));
     if let Some(modal) = modal {
         hints = modal;
     }
+    // The key carries the weight, the word beside it stays quiet.
+    let key = Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD);
     let mut spans = Vec::new();
     let mut used = 0;
-    for (key, label) in hints {
+    for (name, label) in hints {
         // Drop whole hints that do not fit rather than cutting one in half.
-        used += key.chars().count() + label.len() + 3;
-        if used > area.width as usize + 2 {
+        used += name.chars().count() + label.chars().count() + 4;
+        if used > area.width as usize + 3 {
             break;
         }
-        spans.push(Span::styled(key, Style::new().add_modifier(Modifier::REVERSED)));
-        spans.push(Span::styled(format!(" {label}  "), Style::new().fg(Color::DarkGray)));
+        spans.push(Span::styled(name, key));
+        spans.push(Span::styled(format!(" {label}   "), look.muted()));
     }
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
+    f.render_widget(Paragraph::new(Line::from(spans)).style(look.surface()), area);
 }

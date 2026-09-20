@@ -128,6 +128,11 @@ impl Picker {
         }
         // Notes are already newest-first, and the sort is stable, so ties stay in that order.
         scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+        // When something matches well, names that merely happen to contain the
+        // letters somewhere are noise, not candidates.
+        if let Some(&(best, _)) = scored.first().filter(|(best, _)| *best > 0) {
+            scored.retain(|(score, _)| score * 3 >= best);
+        }
         self.hits = scored.into_iter().map(|(_, hit)| hit).collect();
         self.selected = 0;
     }
