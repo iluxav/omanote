@@ -1,3 +1,4 @@
+mod agents;
 mod capture;
 mod clipboard;
 mod config;
@@ -7,6 +8,7 @@ mod editor;
 mod images;
 mod layout;
 mod markdown;
+mod pane;
 mod picker;
 mod saveas;
 mod sync;
@@ -52,6 +54,18 @@ struct App {
     ed: Editor,
     picker: Option<Picker>,
     save_as: Option<SaveAs>,
+    /// The assistant's terminal beside the note, and whether it has the keyboard.
+    pane: Option<pane::Pane>,
+    pane_focused: bool,
+    chooser: Option<agents::Chooser>,
+    /// An agent that quit the moment it started most likely printed why. Its
+    /// pane then stays up until a key is pressed, so the reason can be read.
+    pane_started: Instant,
+    pane_failed: bool,
+    /// Where the note ends and the pane begins, and where the assistant's
+    /// screen is inside the pane, for routing the mouse.
+    pane_x: u16,
+    pane_screen: ratatui::layout::Rect,
     sync: sync::Sync,
     /// What was asked for on the command line when nothing matched: a name for the new note.
     wanted: Option<String>,
@@ -154,6 +168,134 @@ impl App {
         self.toast = None;
         let here = std::env::current_dir().ok();
         self.save_as = Some(SaveAs::new(&self.ed.lines, vaults::all(&vaults::home()), here, self.wanted.as_deref(), after));
+    }
+
+    /// Ctrl+G: open an assistant beside the note, or move the keyboard between
+    /// the two. Which assistant is not built in: the settings may name one,
+    /// otherwise the agents installed on this machine are offered.
+    fn assistant(&mut self) {
+        if self.pane.is_some() {
+            self.pane_focused = !self.pane_focused;
+            return;
+        }
+        if self.ed.path.is_none() {
+            self.say("Save the note first (Ctrl+S): the assistant works on the file");
+            return self.ask_where(After::Stay);
+        }
+        let agents = agents::available(&self.settings.agents);
+        if let Some(fixed) = &self.settings.assistant {
+            return self.open_assistant(agents::named(fixed, &agents));
+        }
+        match agents.len() {
+            0 => self.say("No AI agent found (claude, codex, gemini, …). Install one, or add yours in the settings: omanote --config"),
+            1 => self.open_assistant(agents[0].clone()),
+            _ => {
+                self.picker = None;
+                self.toast = None;
+                self.chooser = Some(agents::Chooser::new(agents, agents::last_used(&vaults::home()).as_deref()));
+            }
+        }
+    }
+
+    fn chooser_key(&mut self, key: KeyEvent) {
+        let Some(chooser) = &mut self.chooser else { return };
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let pick = |app: &mut Self| {
+            if let Some(agent) = app.chooser.take().and_then(|c| c.chosen().cloned()) {
+                agents::remember(&vaults::home(), &agent.name);
+                app.open_assistant(agent);
+            }
+        };
+        match key.code {
+            KeyCode::Esc => self.chooser = None,
+            KeyCode::Char('c' | 'g') if ctrl => self.chooser = None,
+            KeyCode::Up | KeyCode::BackTab => chooser.step(-1),
+            KeyCode::Down | KeyCode::Tab => chooser.step(1),
+            KeyCode::Char(c @ '1'..='9') if (c as usize - '1' as usize) < chooser.agents.len() => {
+                chooser.selected = c as usize - '1' as usize;
+                pick(self);
+            }
+            KeyCode::Enter => pick(self),
+            _ => {}
+        }
+    }
+
+    /// Start `agent` in a pane, in the note's vault, told what you are working
+    /// on. The note is saved first, since the file is what the agent sees.
+    fn open_assistant(&mut self, agent: agents::Agent) {
+        let Some(path) = self.ed.path.clone() else { return };
+        if self.ed.dirty {
+            if let Err(e) = self.ed.save() {
+                return self.say(format!("Could not save: {e}"));
+            }
+        }
+        let path = path.canonicalize().unwrap_or(path);
+        let all = vaults::all(&vaults::home());
+        // The vault the note is in, so the agent can see its neighbours; a
+        // loose file gets its own folder.
+        let in_vault = all.iter().map(|v| &v.path).filter(|v| path.starts_with(v)).max_by_key(|v| v.as_os_str().len());
+        let dir = in_vault.cloned().or_else(|| path.parent().map(PathBuf::from)).unwrap_or_else(|| PathBuf::from("."));
+        let file = path.strip_prefix(&dir).unwrap_or(&path).to_string_lossy().into_owned();
+
+        let mut context = format!(
+            "The user is writing a markdown note in omanote, a terminal editor, and you are in a pane beside it. \
+             The note is {file} (full path: {}); their cursor is on line {}. omanote saves as they type and reloads \
+             the file when it changes on disk, so when asked to change the text, edit the file directly. \
+             Your pane is narrow: keep replies short.",
+            path.display(),
+            self.ed.cursor.row + 1
+        );
+        if let Some(selected) = self.ed.selected_text().filter(|t| !t.trim().is_empty()) {
+            let selected: String = selected.chars().take(4000).collect();
+            context.push_str(&format!("\n\nThey have this text selected:\n{selected}"));
+        }
+        let command = agent
+            .command
+            .replace("{context}", "\"$OMANOTE_CONTEXT\"")
+            .replace("{file}", "\"$OMANOTE_FILE\"")
+            .replace("{dir}", "\"$OMANOTE_DIR\"");
+        let env = [("OMANOTE_CONTEXT", context), ("OMANOTE_FILE", file), ("OMANOTE_DIR", dir.to_string_lossy().into_owned())];
+        match pane::Pane::spawn(&command, &dir, &env, 24, 60) {
+            Ok(mut pane) => {
+                // Say which note it was given: the context itself is invisible.
+                let note = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                pane.label = format!("{} · {note}", agent.name);
+                self.pane = Some(pane);
+                self.pane_started = Instant::now();
+                self.pane_failed = false;
+                self.pane_focused = true;
+                self.repaint = true;
+            }
+            Err(e) => self.say(e),
+        }
+    }
+
+    /// The assistant exited (or never started): give the window back to the note.
+    fn reap_pane(&mut self) {
+        if self.pane_failed || !self.pane.as_mut().is_some_and(|p| p.exited()) {
+            return;
+        }
+        if self.pane_started.elapsed() < Duration::from_secs(4) {
+            self.pane_failed = true;
+            self.pane_focused = true;
+            if let Some(pane) = &mut self.pane {
+                pane.label = format!("{} — exited straight away · any key closes", pane.label);
+            }
+            self.repaint = true;
+            return;
+        }
+        self.close_pane();
+    }
+
+    fn close_pane(&mut self) {
+        {
+            self.pane = None;
+            self.pane_failed = false;
+            self.pane_focused = false;
+            self.pane_x = u16::MAX;
+            self.repaint = true;
+            self.say("Assistant closed");
+        }
     }
 
     /// F2: move, rename or copy the note. One without a file yet just gets saved.
@@ -354,6 +496,26 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return;
         }
+        // Ctrl+G always means "the other side"; everything else goes to
+        // whichever side has the keyboard.
+        let ctrl_g = key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('g' | 'G'));
+        if self.chooser.is_some() {
+            return self.chooser_key(key);
+        }
+        if self.pane_failed {
+            return self.close_pane();
+        }
+        if self.pane_focused && self.save_as.is_none() && self.picker.is_none() {
+            if ctrl_g {
+                self.pane_focused = false;
+            } else if let Some(pane) = &mut self.pane {
+                pane.send_key(key);
+            }
+            return;
+        }
+        if ctrl_g && self.save_as.is_none() && self.picker.is_none() {
+            return self.assistant();
+        }
         if self.save_as.is_some() {
             return self.save_as_key(key);
         }
@@ -458,6 +620,37 @@ impl App {
     }
 
     fn mouse(&mut self, m: MouseEvent) {
+        // A click picks the side. Inside the pane the mouse is ours, not the
+        // assistant's: drag selects (copied on release), the wheel scrolls back.
+        if self.pane.is_some() && self.save_as.is_none() && self.picker.is_none() {
+            let in_pane = m.column >= self.pane_x;
+            if matches!(m.kind, MouseEventKind::Down(_)) {
+                self.pane_focused = in_pane;
+            }
+            let dragging = matches!(m.kind, MouseEventKind::Drag(_) | MouseEventKind::Up(_)) && self.pane_focused;
+            if in_pane || dragging {
+                let screen = self.pane_screen;
+                let row = m.row.saturating_sub(screen.y);
+                let col = m.column.saturating_sub(screen.x);
+                let mut copied = None;
+                if let Some(pane) = &mut self.pane {
+                    match m.kind {
+                        MouseEventKind::ScrollUp => pane.scroll(3),
+                        MouseEventKind::ScrollDown => pane.scroll(-3),
+                        MouseEventKind::Down(MouseButton::Left) => pane.select_from(row, col),
+                        MouseEventKind::Drag(MouseButton::Left) => pane.select_to(row, col),
+                        MouseEventKind::Up(MouseButton::Left) => copied = pane.selected_text(),
+                        _ => {}
+                    }
+                }
+                if let Some(text) = copied {
+                    clipboard::copy(&text);
+                    self.ed.clipboard = text;
+                    self.say("Copied");
+                }
+                return;
+            }
+        }
         if let Some(prompt) = &mut self.save_as {
             match m.kind {
                 MouseEventKind::ScrollUp => prompt.step(-1),
@@ -514,6 +707,11 @@ impl App {
                 self.repaint = true;
             }
             Event::FocusGained => self.repaint = true,
+            Event::Paste(text) if self.pane_focused && self.pane.is_some() => {
+                if let Some(pane) = &mut self.pane {
+                    pane.paste(&text);
+                }
+            }
             Event::Paste(text) => match (&mut self.save_as, &mut self.picker) {
                 (Some(prompt), _) => prompt.edit(|n| n.extend(text.chars().filter(|c| !c.is_control()))),
                 (None, Some(p)) => p.push(&text),
@@ -573,6 +771,10 @@ omanote — a small markdown note editor
   Ctrl+N inside the editor    start a new note (asks to save an unnamed one first)
   Ctrl+P inside the editor    fuzzy-find a note in any vault
   F2 inside the editor        move, rename or copy the note (another vault, another folder)
+  Ctrl+G inside the editor    an AI agent in a pane beside the note: pick from the agent
+                              CLIs you have installed (Claude Code, Codex, Gemini, …) or
+                              your own from the settings. Ctrl+G again moves between the
+                              two; quit the agent to close the pane
 
 Vaults (where Ctrl+P looks; new notes go in ~/.omanote/docs):
   omanote --vl <folder>       add a folder of notes
@@ -762,6 +964,13 @@ fn main() -> std::io::Result<()> {
         picker,
         save_as: None,
         wanted,
+        pane: None,
+        pane_focused: false,
+        chooser: None,
+        pane_started: Instant::now(),
+        pane_failed: false,
+        pane_x: u16::MAX,
+        pane_screen: ratatui::layout::Rect::default(),
         sync: early_sync,
         seen_saves: 0,
         toast: None,
@@ -788,31 +997,51 @@ fn main() -> std::io::Result<()> {
         app.say(format!("config.toml, {first}"));
     }
     let result = (|| -> std::io::Result<()> {
+        let mut redraw = true;
+        let mut drawn = Instant::now();
         while !app.quit {
-            if app.toast.as_ref().is_some_and(|(_, at)| at.elapsed() > TOAST) {
-                app.toast = None;
-            }
-            app.tick();
-            let toast = app.toast.as_ref().map(|(msg, _)| msg.clone());
-            let syncing = app.ed.path.as_ref().and_then(|p| app.sync.state(p, &all_vaults));
-            // Images have to be in the terminal before the frame that refers to them.
-            let size = terminal.size()?;
-            if std::mem::take(&mut app.repaint) {
-                terminal.clear()?;
-            }
-            if let Some((x, y, w, h, table_w)) = ui::text_area(ratatui::layout::Rect::new(0, 0, size.width, size.height), &app.settings) {
-                app.ed.table_w = table_w;
-                app.ed.set_view(x, y, w, h);
-                let pending = app.ed.images.take_outbox();
-                if !pending.is_empty() {
-                    let mut out = stdout();
-                    out.write_all(&pending)?;
-                    out.flush()?;
+            app.reap_pane();
+            // The assistant prints whenever it likes, so with the pane open we
+            // look often, but only draw when something actually changed.
+            let printed = app.pane.as_ref().is_some_and(|p| p.take_dirty());
+            if redraw || printed || drawn.elapsed() >= Duration::from_millis(250) {
+                redraw = false;
+                drawn = Instant::now();
+                if app.toast.as_ref().is_some_and(|(_, at)| at.elapsed() > TOAST) {
+                    app.toast = None;
                 }
+                app.tick();
+                let toast = app.toast.as_ref().map(|(msg, _)| msg.clone());
+                let syncing = app.ed.path.as_ref().and_then(|p| app.sync.state(p, &all_vaults));
+                let size = terminal.size()?;
+                if std::mem::take(&mut app.repaint) {
+                    terminal.clear()?;
+                }
+                let full = ratatui::layout::Rect::new(0, 0, size.width, size.height);
+                let (note, pane_area) = ui::split(full, app.pane.is_some(), app.pane_focused);
+                app.pane_x = pane_area.map_or(u16::MAX, |r| r.x);
+                if let (Some(pane), Some(rect)) = (&mut app.pane, pane_area) {
+                    let screen = ui::pane_screen(rect);
+                    pane.resize(screen.height, screen.width);
+                    app.pane_screen = screen;
+                }
+                // Images have to be in the terminal before the frame that refers to them.
+                if let Some((x, y, w, h, table_w)) = ui::text_area(note, &app.settings).filter(|_| note.width > 0) {
+                    app.ed.table_w = table_w;
+                    app.ed.set_view(x, y, w, h);
+                    let pending = app.ed.images.take_outbox();
+                    if !pending.is_empty() {
+                        let mut out = stdout();
+                        out.write_all(&pending)?;
+                        out.flush()?;
+                    }
+                }
+                let assistant = app.pane.as_ref().map(|p| (p, app.pane_focused));
+                terminal.draw(|f| ui::draw(f, &mut app.ed, app.picker.as_ref(), app.save_as.as_ref(), toast.as_deref(), syncing, &app.settings, app.enhanced_keys, assistant, app.chooser.as_ref()))?;
             }
-            terminal.draw(|f| ui::draw(f, &mut app.ed, app.picker.as_ref(), app.save_as.as_ref(), toast.as_deref(), syncing, &app.settings, app.enhanced_keys))?;
 
-            if event::poll(Duration::from_millis(250))? {
+            let wait = Duration::from_millis(if app.pane.is_some() { 25 } else { 250 });
+            if event::poll(wait)? {
                 // Drain everything pending so a burst of input costs one redraw.
                 loop {
                     app.handle(event::read()?);
@@ -820,11 +1049,13 @@ fn main() -> std::io::Result<()> {
                         break;
                     }
                 }
+                redraw = true;
             } else if app.ed.dirty && app.ed.path.is_some() && app.ed.last_change.elapsed() > AUTOSAVE_IDLE {
                 match app.ed.save() {
                     Ok(_) => app.settings_saved(false),
                     Err(e) => app.say(format!("Could not save: {e}")),
                 }
+                redraw = true;
             }
         }
         Ok(())

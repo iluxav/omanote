@@ -260,7 +260,7 @@ impl Editor {
         row == self.cursor.row || self.selection().is_some_and(|(s, e)| s.row <= row && row <= e.row)
     }
 
-    fn selected_text(&self) -> Option<String> {
+    pub fn selected_text(&self) -> Option<String> {
         let (s, e) = self.selection()?;
         let mut out = String::new();
         for row in s.row..=e.row {

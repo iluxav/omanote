@@ -1,6 +1,6 @@
 [package]
 name = "omanote"
-version = "0.0.10"
+version = "0.0.11"
 edition = "2024"
 description = "An Obsidian-style markdown note editor for the terminal"
 license = "MIT"
@@ -11,9 +11,15 @@ ratatui = "0.29"
 unicode-width = "0.2"
 ureq = "2"
 libc = "0.2"
+portable-pty = "0.9"
+vt100 = "0.15"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 
 [profile.release]
 opt-level = 3
 lto = true
 strip = true
+
+# See vendor/vt100/PATCHED.md: one overflow fix the assistant pane's scrollback needs.
+[patch.crates-io]
+vt100 = { path = "vendor/vt100" }

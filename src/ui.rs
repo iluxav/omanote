@@ -6,9 +6,11 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 
+use crate::agents::Chooser;
 use crate::config::{Align, Config};
 use crate::editor::{Editor, Pos};
 use crate::layout::{VRow, locate};
+use crate::pane::Pane;
 use crate::picker::{Picker, Row, age};
 use crate::saveas::{After, SaveAs};
 use crate::theme;
@@ -35,6 +37,48 @@ pub fn text_area(area: Rect, config: &Config) -> Option<(u16, u16, u16, u16, u16
     Some((x, 1, w, area.height - 4, area.width - margin - x))
 }
 
+/// With the assistant open the window is two columns: the note, and the
+/// assistant's terminal. Too narrow for both, and whichever has the keyboard
+/// gets the whole window. Returns (note area, pane area).
+pub fn split(full: Rect, pane_open: bool, pane_focused: bool) -> (Rect, Option<Rect>) {
+    if !pane_open {
+        return (full, None);
+    }
+    if full.width < 96 {
+        let nothing = Rect::new(full.x, full.y, 0, full.height);
+        return if pane_focused { (nothing, Some(full)) } else { (full, None) };
+    }
+    let left = full.width * 56 / 100;
+    (Rect::new(full.x, full.y, left, full.height), Some(Rect::new(full.x + left, full.y, full.width - left, full.height)))
+}
+
+/// Where the assistant's terminal itself goes inside its pane: under the title
+/// row, right of the rule.
+pub fn pane_screen(pane: Rect) -> Rect {
+    Rect::new(pane.x + 2, pane.y + 1, pane.width.saturating_sub(3), pane.height.saturating_sub(1))
+}
+
+fn draw_pane(f: &mut Frame, pane: &Pane, area: Rect, focused: bool) -> Option<(u16, u16)> {
+    let look = theme::get();
+    f.render_widget(Clear, area);
+    let rule = Style::new().fg(if focused { Color::Blue } else { Color::DarkGray });
+    for y in area.y..area.y + area.height {
+        f.render_widget(Paragraph::new(Line::styled("│", if focused { rule } else { look.faint() })), Rect::new(area.x, y, 1, 1));
+    }
+    let hint = match (pane.scrolled(), focused) {
+        (0, true) => "^G back to the note".to_string(),
+        (0, false) => "^G to the assistant".to_string(),
+        (n, _) => format!("↑ {n} lines back · any key returns"),
+    };
+    let title = Line::from(vec![
+        Span::styled(format!(" {} ", pane.label), Style::new().add_modifier(Modifier::BOLD)),
+        Span::styled(hint, look.muted()),
+    ]);
+    f.render_widget(Paragraph::new(title), Rect::new(area.x + 1, area.y, area.width.saturating_sub(1), 1));
+    let cursor = pane.draw(f.buffer_mut(), pane_screen(area));
+    cursor.filter(|_| focused)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn draw(
     f: &mut Frame,
@@ -45,8 +89,20 @@ pub fn draw(
     sync: Option<&str>,
     config: &Config,
     enhanced_keys: bool,
+    assistant: Option<(&Pane, bool)>,
+    chooser: Option<&Chooser>,
 ) {
-    let area = f.area();
+    let (area, pane_area) = split(f.area(), assistant.is_some(), assistant.is_some_and(|(_, focused)| focused));
+    if let (Some((pane, focused)), Some(rect)) = (assistant, pane_area) {
+        if let Some(xy) = draw_pane(f, pane, rect, focused) {
+            f.set_cursor_position(xy);
+        }
+    }
+    // The note may have no room at all (a narrow window with the assistant in front).
+    if area.width == 0 {
+        return;
+    }
+    let typing_in_pane = assistant.is_some_and(|(_, focused)| focused);
     let Some((x, _, w, h, table_w)) = text_area(area, config) else { return };
     ed.table_w = table_w;
     ed.set_view(x, 1, w, h);
@@ -80,7 +136,7 @@ pub fn draw(
     }
 
     f.render_widget(Paragraph::new(out), Rect::new(x, 1, area.width - x, h));
-    if let Some(xy) = cursor_xy {
+    if let Some(xy) = cursor_xy.filter(|_| !typing_in_pane) {
         f.set_cursor_position(xy);
     }
 
@@ -93,6 +149,7 @@ pub fn draw(
     }
     draw_status(f, ed, toast, sync, Rect::new(x, area.height - 2, w, 1));
     let hints = match (save_as, picker) {
+        _ if chooser.is_some() => Some(vec![("↑↓", "select"), ("Enter", "open"), ("1-9", "pick"), ("Esc", "cancel")]),
         (Some(p), _) if p.moving.is_some() && p.keep_original => Some(vec![("Enter", "copy"), ("^K", "move instead"), ("↑↓", "where"), ("Esc", "cancel")]),
         (Some(p), _) if p.moving.is_some() => Some(vec![("Enter", "move"), ("^K", "copy instead"), ("↑↓", "where"), ("Esc", "cancel")]),
         (Some(p), _) if matches!(p.after, After::Stay) => Some(vec![("Enter", "save"), ("↑↓", "vault"), ("Esc", "cancel")]),
@@ -101,20 +158,22 @@ pub fn draw(
         (None, None) => None,
     };
     draw_hints(f, hints, enhanced_keys && ed.markdown, ed.markdown, Rect::new(x, area.height - 1, w, 1));
-    if let Some(prompt) = save_as {
-        draw_save_as(f, prompt, toast, x, w, area.height - 1);
+    if let Some(chooser) = chooser {
+        draw_chooser(f, chooser, x, w, area.height - 1, area.width);
+    } else if let Some(prompt) = save_as {
+        draw_save_as(f, prompt, toast, x, w, area.height - 1, area.width);
     } else if let Some(picker) = picker {
-        draw_picker(f, picker, x, w, area.height - 1);
+        draw_picker(f, picker, x, w, area.height - 1, area.width);
     }
 }
 
 /// A drawer rising from the hint bar, on the same surface as the footer so the
 /// two read as one piece. Returns where its contents go.
-fn drawer(f: &mut Frame, title: &str, note: &str, x: u16, w: u16, bottom: u16, rows: u16) -> Rect {
+fn drawer(f: &mut Frame, title: &str, note: &str, x: u16, w: u16, bottom: u16, rows: u16, band: u16) -> Rect {
     let look = theme::get();
     let h = rows + 1;
     let y = bottom.saturating_sub(h);
-    let full = Rect::new(0, y, f.area().width, h);
+    let full = Rect::new(0, y, band, h);
     f.render_widget(Clear, full);
     f.render_widget(Block::new().style(look.surface()), full);
 
@@ -131,6 +190,28 @@ fn drawer(f: &mut Frame, title: &str, note: &str, x: u16, w: u16, bottom: u16, r
     ]);
     f.render_widget(Paragraph::new(head).style(look.surface()), Rect::new(x, y, w, 1));
     Rect::new(x, y + 1, w, rows)
+}
+
+/// Ctrl+G with more than one agent installed: which one?
+fn draw_chooser(f: &mut Frame, c: &Chooser, x: u16, w: u16, bottom: u16, band: u16) {
+    let look = theme::get();
+    let shown = c.agents.len().clamp(1, PICKER_ROWS).min(bottom.saturating_sub(4) as usize);
+    let area = drawer(f, "Assistant", "opens beside the note", x, w, bottom, shown as u16, band);
+    let first = c.selected.saturating_sub(shown - 1);
+    let lines: Vec<Line> = c
+        .agents
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(shown)
+        .map(|(i, agent)| {
+            let key = if i < 9 { format!("{}  ", i + 1) } else { "   ".to_string() };
+            // The program it runs, without the placeholders, as a quiet reminder.
+            let runs = agent.command.split_whitespace().next().unwrap_or("").rsplit('/').next().unwrap_or("").to_string();
+            list_row(i == c.selected, vec![Span::styled(key, look.muted()), Span::raw(agent.name.clone())], runs, w)
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines).style(look.surface()), area);
 }
 
 /// One row of a drawer list: marker, text, and a quiet note at the right edge.
@@ -156,7 +237,7 @@ fn list_row(selected: bool, mut text: Vec<Span<'static>>, note: String, w: u16) 
 }
 
 /// Same place and shape as the picker: title rule, the name being typed, the vaults.
-fn draw_save_as(f: &mut Frame, p: &SaveAs, toast: Option<&str>, x: u16, w: u16, bottom: u16) {
+fn draw_save_as(f: &mut Frame, p: &SaveAs, toast: Option<&str>, x: u16, w: u16, bottom: u16, band: u16) {
     let look = theme::get();
     let shown = p.vaults.len().clamp(1, PICKER_ROWS).min(bottom.saturating_sub(5) as usize);
     let title = match p.after {
@@ -167,7 +248,7 @@ fn draw_save_as(f: &mut Frame, p: &SaveAs, toast: Option<&str>, x: u16, w: u16, 
         After::Open(_) | After::New => "Save this note first?",
     };
     let note = if p.moving.is_some() && p.keep_original { "the original stays" } else { "" };
-    let area = drawer(f, title, note, x, w, bottom, shown as u16 + 2);
+    let area = drawer(f, title, note, x, w, bottom, shown as u16 + 2, band);
 
     let label = "   Name  ";
     let mut lines = vec![
@@ -199,7 +280,7 @@ fn draw_save_as(f: &mut Frame, p: &SaveAs, toast: Option<&str>, x: u16, w: u16, 
 }
 
 /// The note finder: what you typed, then the matches.
-fn draw_picker(f: &mut Frame, p: &Picker, x: u16, w: u16, bottom: u16) {
+fn draw_picker(f: &mut Frame, p: &Picker, x: u16, w: u16, bottom: u16, band: u16) {
     let look = theme::get();
     let shown = p.len().clamp(1, PICKER_ROWS).min(bottom.saturating_sub(4) as usize);
     let notes = match p.total() {
@@ -211,7 +292,7 @@ fn draw_picker(f: &mut Frame, p: &Picker, x: u16, w: u16, bottom: u16) {
     let place = p.title();
     let count = place.chars().count();
     let place = if count > room { format!("…{}", place.chars().skip(count - room + 1).collect::<String>()) } else { place };
-    let area = drawer(f, "Open note", &format!("{place} · {notes}"), x, w, bottom, shown as u16 + 1);
+    let area = drawer(f, "Open note", &format!("{place} · {notes}"), x, w, bottom, shown as u16 + 1, band);
 
     let prompt = " ›  ";
     let mut lines = vec![Line::from(vec![Span::styled(prompt, Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD)), Span::raw(p.query.clone())])];
@@ -331,7 +412,7 @@ fn draw_status(f: &mut Frame, ed: &Editor, toast: Option<&str>, sync: Option<&st
 
 fn draw_hints(f: &mut Frame, modal: Option<Vec<(&'static str, &'static str)>>, italic: bool, markdown: bool, area: Rect) {
     let look = theme::get();
-    let mut hints = vec![("^Q", "quit"), ("^N", "new"), ("^P", "open"), ("^S", "save"), ("F2", "move"), ("^Z", "undo"), ("^Y", "redo"), ("^C", "copy"), ("^X", "cut"), ("^V", "paste")];
+    let mut hints = vec![("^Q", "quit"), ("^N", "new"), ("^P", "open"), ("^S", "save"), ("^G", "assistant"), ("F2", "move"), ("^Z", "undo"), ("^Y", "redo"), ("^C", "copy"), ("^X", "cut"), ("^V", "paste")];
     if markdown {
         hints.push(("^B", "bold"));
         // Without the kitty keyboard protocol Ctrl+I is indistinguishable from Tab.

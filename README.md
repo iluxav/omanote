@@ -56,6 +56,7 @@ Write first, name it later: on a new note `Ctrl+S` asks where to keep it (a vaul
 | `Ctrl+P` | find a note by fuzzy search, or create one |
 | `Ctrl+S` / `Ctrl+Q` | save / quit |
 | `F2` | move, rename or copy the note: another vault, another folder, another name |
+| `Ctrl+G` | an AI agent of your choice in a pane beside the note |
 | `Ctrl+Z` / `Ctrl+Y` | undo / redo |
 | `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | copy / cut / paste |
 | `Shift+arrows`, `Ctrl+A` | select |
@@ -65,6 +66,28 @@ Write first, name it later: on a new note `Ctrl+S` asks where to keep it (a vaul
 | `Enter` | continues lists, numbering and quotes |
 
 The mouse works too: click, drag to select, double-click a word, scroll, click a checkbox.
+
+### An assistant beside the note
+
+`Ctrl+G` opens an AI agent in a pane on the right, inside omanote's own window: a real terminal running the agent's own CLI.
+
+- **No agent is built in.** omanote looks for the agent CLIs you have installed (Claude Code, Codex, Gemini, opencode, Qwen Code, Aider, Cursor Agent, GitHub Copilot, Crush, Amp, Goose) and asks which one: arrows and `Enter`, or its number. It starts on the one you used last. With a single agent installed there is nothing to ask.
+- It starts in the note's vault, so it can see your other notes, and it is told which note you are in, the line your cursor is on, and any text you have selected. Claude Code takes that silently, as an addition to its system prompt, so nothing is sent until you type; Codex, Gemini, opencode and Qwen take it as their opening message; the others are simply started in the right folder.
+- `Ctrl+G` again moves the keyboard between the note and the agent; a click does the same. Quit the agent and the pane closes. If it quits the moment it starts, the pane stays up so you can read why.
+- The note is saved before the agent opens, saves as you type, and reloads by itself when the agent edits the file, so you can watch changes land.
+- In the pane, drag with the mouse to select text: it is copied when you let go, ready to paste into the note with `Ctrl+V`. The wheel scrolls back through the conversation; any key returns to the present.
+- The pane's title names the agent and the note it was given.
+- In a window too narrow for two columns, whichever side has the keyboard gets the whole window.
+
+Add your own agents, change how a known one is started, or skip the menu, in the settings (`omanote --config`):
+
+```toml
+agent.Work bot = "workbot --chat {context}"
+agent.claude   = "claude --model opus --append-system-prompt {context}"
+assistant      = "codex"          # always this one: a name, or a full command
+```
+
+`{context}` is the description above, `{file}` the note and `{dir}` the folder the agent starts in. The pane is a small terminal emulator: colours, full-screen programs and paste work. The mouse belongs to omanote (select, scroll), so the agent itself never sees it, and terminal-specific extras are not passed through.
 
 ### Tables
 
