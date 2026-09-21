@@ -5,6 +5,7 @@ mod config;
 mod desktop;
 mod diacritics;
 mod editor;
+mod find;
 mod images;
 mod layout;
 mod markdown;
@@ -12,6 +13,7 @@ mod mention;
 mod now;
 mod pane;
 mod picker;
+mod remind;
 mod saveas;
 mod sync;
 mod table;
@@ -75,6 +77,9 @@ struct App {
     save_as: Option<SaveAs>,
     /// The note suggestions open under an `@` being typed.
     mention: Option<Mention>,
+    /// Ctrl+F: the find bar, and what was searched for last (for F3).
+    find: Option<find::Find>,
+    last_find: String,
     /// Notes left behind on the way here, and where the cursor was in each:
     /// Alt+← walks back through them, Alt+→ forward again.
     history: Vec<(PathBuf, Pos)>,
@@ -545,6 +550,7 @@ impl App {
         self.ed = self.editor(&text, Some(path));
         self.seen_saves = 0;
         self.mention = None;
+        self.close_find();
     }
 
     fn editor(&self, text: &str, path: Option<PathBuf>) -> Editor {
@@ -736,11 +742,89 @@ impl App {
         if self.picker.is_some() {
             return self.picker_key(key);
         }
+        if self.find.is_some() {
+            return self.find_key(key);
+        }
         if self.mention_key(key) {
             return;
         }
         self.editor_key(key);
         self.mention_after(key);
+    }
+
+    /// Ctrl+F, or F3 to carry on with the last search.
+    fn open_find(&mut self, step: isize) {
+        let mut find = find::Find::open(&self.ed, &self.last_find);
+        self.mention = None;
+        self.toast = None;
+        if step != 0 && !find.query.is_empty() {
+            find.refresh(&mut self.ed);
+            // Already on a match (F3 pressed again): move on from it.
+            if find.matches.len() > 1 {
+                find.step(step, &mut self.ed);
+            }
+        } else {
+            find.refresh(&mut self.ed);
+        }
+        self.find = Some(find);
+    }
+
+    fn close_find(&mut self) {
+        if let Some(find) = self.find.take() {
+            if !find.query.is_empty() {
+                self.last_find = find.query;
+            }
+        }
+    }
+
+    fn find_key(&mut self, key: KeyEvent) {
+        let Some(find) = &mut self.find else { return };
+        let ed = &mut self.ed;
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        match key.code {
+            KeyCode::Esc => self.close_find(),
+            KeyCode::Enter | KeyCode::F(3) if shift => find.step(-1, ed),
+            KeyCode::Enter | KeyCode::F(3) | KeyCode::Down | KeyCode::Tab => find.step(1, ed),
+            KeyCode::Up | KeyCode::BackTab => find.step(-1, ed),
+            KeyCode::Backspace if ctrl || alt => {
+                find.delete_word();
+                find.refresh(ed);
+            }
+            KeyCode::Backspace => {
+                find.query.pop();
+                find.refresh(ed);
+            }
+            KeyCode::Char(c) if ctrl => match c.to_ascii_lowercase() {
+                'f' | 'n' => find.step(1, ed),
+                'p' => find.step(-1, ed),
+                'u' => {
+                    find.query.clear();
+                    find.refresh(ed);
+                }
+                'w' | 'h' => {
+                    find.delete_word();
+                    find.refresh(ed);
+                }
+                'c' => self.close_find(),
+                'q' => {
+                    self.close_find();
+                    self.quit();
+                }
+                _ => {}
+            },
+            KeyCode::Char(c) if !alt => {
+                find.query.push(c);
+                find.refresh(ed);
+            }
+            // Anything else is about the note, not the search: back to the note with it.
+            KeyCode::Left | KeyCode::Right | KeyCode::Home | KeyCode::End | KeyCode::PageUp | KeyCode::PageDown | KeyCode::Delete => {
+                self.close_find();
+                self.editor_key(key);
+            }
+            _ => {}
+        }
     }
 
     /// Keys the `@` suggestions keep for themselves. Everything else is typing,
@@ -864,6 +948,7 @@ impl App {
         match key.code {
             KeyCode::Char(c) if ctrl => match c.to_ascii_lowercase() {
                 'q' => self.quit(),
+                'f' => self.open_find(0),
                 'o' => self.follow(self.ed.cursor, shift),
                 'p' => {
                     let all = vaults::all(&vaults::home());
@@ -939,6 +1024,7 @@ impl App {
             KeyCode::Tab => ed.tab(),
             KeyCode::BackTab => ed.backtab(),
             KeyCode::F(2) => self.relocate(),
+            KeyCode::F(3) => self.open_find(if shift { -1 } else { 1 }),
             KeyCode::F(6) => self.swap_focus(),
             KeyCode::Esc => ed.clear_selection(),
             _ => {}
@@ -1045,6 +1131,9 @@ impl App {
             }
             return;
         }
+        if matches!(m.kind, MouseEventKind::Down(_)) {
+            self.close_find();
+        }
         // Over the other note: the wheel scrolls it where it is, a click moves in.
         if self.other_area.is_some_and(|r| (r.x..r.x + r.width).contains(&m.column)) {
             match m.kind {
@@ -1123,6 +1212,12 @@ impl App {
                 (Some(prompt), _) => prompt.edit(|n| n.extend(text.chars().filter(|c| !c.is_control()))),
                 (None, Some(p)) => p.push(&text),
                 // A terminal asked to paste a picture has no text to send: look for ourselves.
+                (None, None) if self.find.is_some() => {
+                    if let Some(find) = &mut self.find {
+                        find.query.extend(text.chars().take_while(|c| *c != '\n').filter(|c| !c.is_control()));
+                        find.refresh(&mut self.ed);
+                    }
+                }
                 (None, None) if text.is_empty() => self.paste_clipboard(),
                 (None, None) => {
                     self.paste_text(&text);
@@ -1188,6 +1283,9 @@ omanote — a small markdown note editor
   Ctrl+N inside the editor    start a new note (asks to save an unnamed one first)
   Ctrl+P inside the editor    fuzzy-find a note in any vault
   F2 inside the editor        move, rename or copy the note (another vault, another folder)
+  Ctrl+F inside the editor    find in the note: matches light up as you type, Enter or
+                              the arrows move between them, Esc leaves you on the match.
+                              F3 / Shift+F3 search again for the same thing
   @ inside the editor         link a note: type @ and a few letters, pick from the list
                               (the last entry creates a note by that name), Enter
   Ctrl+K                      make the selected text a link: [text](), with the cursor
@@ -1208,6 +1306,15 @@ omanote — a small markdown note editor
                               CLIs you have installed (Claude Code, Codex, Gemini, …) or
                               your own from the settings. Ctrl+G again moves between the
                               two; quit the agent to close the pane
+
+Quick notes and reminders:
+  omanote --capture <text>    add a line to inbox.md in the default vault, without the editor
+  omanote --capture \"call the dentist !tomorrow 9:00\"
+                              …and be reminded: end with ! and a time. !30m  !2h  !15:30
+                              !fri 10:00  !2026-09-25 14:00, or what repeats:
+                              !every mon 3pm, tue 1pm   !every weekday 9:30   !every day 8am
+  omanote --reminders         what is coming up (on / off: start or stop the systemd user
+                              timer that fires them; the first reminder turns it on)
 
 Vaults (where Ctrl+P looks; new notes go in ~/.omanote/docs):
   omanote --vl <folder>       add a folder of notes
@@ -1284,8 +1391,23 @@ fn cli(args: &[String]) -> Result<(Target, bool, bool, Option<String>), String> 
                 // Everything after the flag is the note, quoted or not.
                 let text: Vec<String> = it.by_ref().cloned().collect();
                 let vault = vaults::all(&home).first().map(|v| v.path.clone()).unwrap_or_default();
-                capture::capture(&vault, &text.join(" "))?
+                capture::capture(&vault, &text.join(" "), true)?
             }
+            "--remind" => {
+                // What the timer runs, every minute. Says nothing unless asked to by a failure.
+                let vault = vaults::all(&home).first().map(|v| v.path.clone()).unwrap_or_default();
+                remind::run(&home, &capture::inbox(&vault))?;
+                std::process::exit(0);
+            }
+            "--reminders" => match it.next().map(String::as_str) {
+                Some("on") => remind::turn_on()?,
+                Some("off") => remind::turn_off()?,
+                None => {
+                    let vault = vaults::all(&home).first().map(|v| v.path.clone()).unwrap_or_default();
+                    remind::list(&capture::inbox(&vault)).trim_end().to_string()
+                }
+                Some(other) => return Err(format!("--reminders takes on, off or nothing, not {other}")),
+            },
             "--config" => {
                 // Open the settings in the editor itself; saving applies them.
                 let file = config::ensure(&home).map_err(|e| format!("cannot write the config: {e}"))?;
@@ -1440,6 +1562,8 @@ fn main() -> std::io::Result<()> {
         toast: None,
         last_click: None,
         mention: None,
+        find: None,
+        last_find: String::new(),
         now: None,
         pane_agent: String::new(),
         pane_dir: PathBuf::new(),
@@ -1544,6 +1668,7 @@ fn main() -> std::io::Result<()> {
                     assistant: app.pane.as_ref().map(|p| (p, app.pane_focused)),
                     chooser: app.chooser.as_ref(),
                     mention: app.mention.as_ref(),
+                    find: app.find.as_ref(),
                     back: back.as_deref(),
                     places: (&places.0, &places.1),
                 };

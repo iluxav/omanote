@@ -9,6 +9,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::remind;
+
 pub fn inbox(vault: &Path) -> PathBuf {
     vault.join("inbox.md")
 }
@@ -37,15 +39,40 @@ fn now() -> (String, String) {
     (date.to_string(), time.to_string())
 }
 
-pub fn capture(vault: &Path, text: &str) -> Result<String, String> {
+/// `timer`: make sure the reminder timer runs if this capture needs it.
+pub fn capture(vault: &Path, text: &str, timer: bool) -> Result<String, String> {
     if text.trim().is_empty() {
         return Err("nothing to capture — usage: omanote --capture \"some text\"".into());
     }
     let file = inbox(vault);
     let existing = std::fs::read_to_string(&file).unwrap_or_default();
     let (date, time) = now();
-    std::fs::create_dir_all(vault).and_then(|_| std::fs::write(&file, appended(&existing, &date, &time, text))).map_err(|e| format!("cannot write {}: {e}", file.display()))?;
-    Ok(format!("Captured to {}", crate::vaults::tilde(&file)))
+    // "call the dentist !tomorrow 9:00": the time goes into the note as a
+    // date, which is what the reminder timer reads.
+    let (words, reminder) = remind::split(text.trim(), remind::now());
+    let line = match &reminder {
+        Ok(Some(when)) => format!("{words} ⏰ {}", remind::render(when)).trim().to_string(),
+        _ => words,
+    };
+    std::fs::create_dir_all(vault).and_then(|_| std::fs::write(&file, appended(&existing, &date, &time, &line))).map_err(|e| format!("cannot write {}: {e}", file.display()))?;
+    let mut said = format!("Captured to {}", crate::vaults::tilde(&file));
+    match reminder {
+        Ok(Some(when)) => {
+            let at = remind::next(&when, remind::now()).map(remind::friendly).unwrap_or_default();
+            let how = if matches!(when, remind::When::Every(_)) { format!("{}, next {at}", remind::render(&when)) } else { at };
+            said.push_str(&format!(" · reminder {how}"));
+            // A reminder nobody is watching for is a promise broken: see to the timer.
+            if timer && !remind::timer_on() {
+                match remind::turn_on() {
+                    Ok(_) => said.push_str(" · reminder timer turned on (omanote --reminders off stops it)"),
+                    Err(e) => said.push_str(&format!(" · BUT the reminder timer is not running: {e}")),
+                }
+            }
+        }
+        Err(what) => said.push_str(&format!(" · no reminder: \"{what}\" is not a time I can read (try !30m, !fri 10:00, !every mon 3pm)")),
+        Ok(None) => {}
+    }
+    Ok(said)
 }
 
 #[cfg(test)]
@@ -69,12 +96,19 @@ mod tests {
     fn writes_the_inbox_and_refuses_nothing() {
         let vault = std::env::temp_dir().join(format!("omanote-capture-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&vault);
-        assert!(capture(&vault, "   ").is_err());
-        assert!(capture(&vault, "first thing").unwrap().contains("inbox.md"));
-        capture(&vault, "second thing").unwrap();
+        assert!(capture(&vault, "   ", false).is_err());
+        assert!(capture(&vault, "first thing", false).unwrap().contains("inbox.md"));
+        capture(&vault, "second thing", false).unwrap();
         let text = std::fs::read_to_string(inbox(&vault)).unwrap();
         assert_eq!(text.matches("## ").count(), 1);
         assert!(text.contains("first thing") && text.contains("second thing"));
+
+        let said = capture(&vault, "pick up liam !every mon 3pm, tue 1pm", false).unwrap();
+        assert!(said.contains("reminder every mon 15:00, tue 13:00, next "), "{said}");
+        let said = capture(&vault, "so !important", false).unwrap();
+        assert!(said.contains("no reminder") && said.contains("!important"), "{said}");
+        let text = std::fs::read_to_string(inbox(&vault)).unwrap();
+        assert!(text.contains(" pick up liam ⏰ every mon 15:00, tue 13:00\n") && text.contains(" so !important\n"), "{text}");
         let _ = std::fs::remove_dir_all(vault);
     }
 }

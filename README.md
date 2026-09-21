@@ -55,6 +55,7 @@ Write first, name it later: on a new note `Ctrl+S` asks where to keep it (a vaul
 | `Ctrl+N` | start a new note |
 | `Ctrl+P` | find a note by fuzzy search, or create one |
 | `Ctrl+S` / `Ctrl+Q` | save / quit |
+| `Ctrl+F`, `F3` | find in the note, find the next one |
 | `F2` | move, rename or copy the note: another vault, another folder, another name |
 | `@` | link another note: suggestions as you type, or create one |
 | `Ctrl+K` | make the selected text a link |
@@ -72,6 +73,12 @@ Write first, name it later: on a new note `Ctrl+S` asks where to keep it (a vaul
 | `Enter` | continues lists, numbering and quotes |
 
 The mouse works too: click, drag to select, double-click a word, scroll, click a checkbox.
+
+### Finding text
+
+`Ctrl+F` searches the note you are in. The search takes the footer's place, so the text stays in view: every match lights up as you type, the one you are on is selected, and the count (`3 of 12`) sits on the right. `Enter` or `↓` goes to the next match, `↑` or `Shift+Enter` to the one before, round and round; `Esc` closes the search and leaves the match selected, so typing replaces it and `Ctrl+C` copies it. The search starts from where your cursor was, and adding a letter narrows it from there rather than jumping ahead.
+
+Case is ignored until you type a capital: `japan` finds `Japan` and `JAPAN`, `Japan` finds only that. With a few words selected, `Ctrl+F` starts on them. `F3` and `Shift+F3` search again for the last thing you looked for. Text that markdown hides, such as the address inside a link, is found too, and shows itself when the search lands on it. It works the same in plain-text files, and with two notes open it searches the one that has the keyboard.
 
 ### Linking notes
 
@@ -164,6 +171,29 @@ omarchy plugin add https://github.com/iluxav/omarchy-omanote --enable
 ```
 
 `omanote --capture "call the dentist"` is what quick capture runs: it appends a line to `inbox.md` in your default vault, under a heading for the day, without opening the editor.
+
+### Reminders
+
+End a quick capture with `!` and a time, and it comes back as a desktop notification:
+
+```sh
+omanote --capture "call the dentist !tomorrow 9:00"
+omanote --capture "stretch !30m"
+omanote --capture "send the invoice !fri 10:00"
+omanote --capture "pick up liam !every mon 3pm, tue 1pm"
+omanote --capture "standup !every weekday 9:30"
+```
+
+| | |
+| --- | --- |
+| once | `!30m` `!2h` `!1h30m` `!3d` · `!15:30` `!3pm` (today, or tomorrow if that has passed) · `!tomorrow 9:00` · `!fri 10:00` · `!2026-09-25 14:00` |
+| repeating | `!every mon 3pm, tue 1pm` · `!every mon wed fri 8:00` · `!every weekday 9:30` · `!every weekend 10:00` · `!every day 8am` |
+
+A day without a time means 9:00. Commas, "at", "on" and "and" are fine: `!every Monday at 3pm and Tuesday 1 pm` reads the same. The capture answers with what it understood, and says so if it could not read the time (the note is kept either way).
+
+The inbox is the only record. The line is written with its time, `- 14:02 call the dentist ⏰ 2026-09-21 09:00` or `… ⏰ every mon 15:00, tue 13:00`, and you can edit it or write one by hand in that form. To cancel a reminder, delete its line, or make it a task and tick it off (`- [x]`). Nothing is marked when a reminder fires. Instead, a systemd user timer runs `omanote --remind` every minute, and that fires whatever came due since it last looked, remembering only when that was (`~/.omanote/remind-state`). So a reminder that came due while the machine was asleep or off still arrives, as "Missed reminder · Mon 21 Sep 09:00", and nothing arrives twice. After a long absence a repeating reminder arrives once, not once per week you were away.
+
+`omanote --reminders` lists what is coming up. The timer is turned on by the first capture that needs it; `omanote --reminders off` removes it and `on` puts it back. Notifications go through Omarchy's own (`omarchy-notification-send`) where there is one, `notify-send` elsewhere. The AI chat knows all this, so "remind me on Friday morning to send the invoice" works there too. Reminders need systemd, so Linux only for now.
 
 ## Settings
 

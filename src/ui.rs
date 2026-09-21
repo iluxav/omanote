@@ -9,6 +9,7 @@ use ratatui::widgets::{Block, Clear, Paragraph};
 use crate::agents::Chooser;
 use crate::config::{Align, Config};
 use crate::editor::{Editor, Pos};
+use crate::find::Find;
 use crate::layout::{VRow, locate};
 use crate::mention::Mention;
 use crate::pane::Pane;
@@ -135,13 +136,14 @@ pub struct Scene<'a> {
     pub assistant: Option<(&'a Pane, bool)>,
     pub chooser: Option<&'a Chooser>,
     pub mention: Option<&'a Mention>,
+    pub find: Option<&'a Find>,
     pub back: Option<&'a str>,
     /// Where each note is (`vault/folder/`): the focused one's, then the other's.
     pub places: (&'a str, &'a str),
 }
 
 pub fn draw(f: &mut Frame, ed: &mut Editor, scene: Scene) {
-    let Scene { panes, other, on_right, picker, save_as, toast, sync, config, assistant, chooser, mention, back, places } = scene;
+    let Scene { panes, other, on_right, picker, save_as, toast, sync, config, assistant, chooser, mention, find, back, places } = scene;
     if let (Some((pane, focused)), Some(rect)) = (assistant, panes.agent) {
         if let Some(xy) = draw_pane(f, pane, rect, focused) {
             f.set_cursor_position(xy);
@@ -166,7 +168,7 @@ pub fn draw(f: &mut Frame, ed: &mut Editor, scene: Scene) {
         let rule: Vec<Line> = (0..panes.left.height).map(|_| Line::styled("│", theme::get().faint())).collect();
         f.render_widget(Paragraph::new(rule), Rect::new(x, panes.left.y, 1, panes.left.height));
     }
-    let focus = Focus { toast, sync, back, split, cursor: !typing_in_pane };
+    let focus = Focus { toast, sync, back, split, find, cursor: !typing_in_pane };
     let cursor_xy = draw_note(f, ed, mine, config, places.0, Some(focus));
 
     let area = panes.notes();
@@ -187,6 +189,7 @@ struct Focus<'a> {
     sync: Option<&'a str>,
     back: Option<&'a str>,
     split: bool,
+    find: Option<&'a Find>,
     cursor: bool,
 }
 
@@ -198,6 +201,7 @@ fn draw_note(f: &mut Frame, ed: &mut Editor, area: Rect, config: &Config, place:
     ed.set_view(x, 1, w, h);
 
     let focused = focus.is_some();
+    let find = focus.as_ref().and_then(|f| f.find);
     let sel = ed.selection();
     let mut out: Vec<Line> = Vec::new();
     let mut map = Vec::new();
@@ -216,7 +220,8 @@ fn draw_note(f: &mut Frame, ed: &mut Editor, area: Rect, config: &Config, place:
                 let cx = (x + vr.x_of(ed.cursor.col)).min(right_edge - 1);
                 cursor_xy = Some((cx, 1 + out.len() as u16));
             }
-            out.push(render_row(vr, row, ed.lines[row].len(), sel));
+            let marks: Vec<(usize, usize)> = find.map(|f| f.on_row(row).collect()).unwrap_or_default();
+            out.push(render_row(vr, row, ed.lines[row].len(), sel, &marks, find.and_then(|f| f.here(row))));
             map.push((row, vi));
         }
         row += 1;
@@ -238,6 +243,11 @@ fn draw_note(f: &mut Frame, ed: &mut Editor, area: Rect, config: &Config, place:
     }
     let (status, hints) = (Rect::new(x, area.height - 2, w, 1), Rect::new(x, area.height - 1, w, 1));
     match focus {
+        Some(Focus { find: Some(find), .. }) => {
+            ed.view.back = None;
+            draw_find(f, find, status, hints);
+            return None;
+        }
         Some(focus) => {
             if let Some(xy) = cursor_xy.filter(|_| focus.cursor) {
                 f.set_cursor_position(xy);
@@ -544,13 +554,27 @@ fn draw_picker(f: &mut Frame, p: &Picker, area: Rect) {
     f.set_cursor_position((cx.min(inner.x + w.saturating_sub(1)), inner.y));
 }
 
-fn render_row(vr: &VRow, row: usize, line_len: usize, sel: Option<(Pos, Pos)>) -> Line<'static> {
+/// `marks`: what the find bar matched on this line, in yellow; `here`: the
+/// match the search is on, in light green so it stands out from the rest.
+fn render_row(vr: &VRow, row: usize, line_len: usize, sel: Option<(Pos, Pos)>, marks: &[(usize, usize)], here: Option<(usize, usize)>) -> Line<'static> {
     let selected = |col: usize| sel.is_some_and(|(s, e)| s <= Pos { row, col } && Pos { row, col } < e);
+    let marked = |col: usize| marks.iter().any(|&(from, to)| (from..to).contains(&col));
+    let current = |col: usize| here.is_some_and(|(from, to)| (from..to).contains(&col));
+    let lit = Style::new().fg(Color::Black).bg(Color::Yellow);
+    let lit_here = Style::new().fg(Color::Black).bg(Color::LightGreen);
     let mut spans: Vec<Span> = vr.lead.iter().map(|(t, s)| Span::styled(t.clone(), *s)).collect();
     let mut run = String::new();
     let mut run_style = Style::default();
     for cell in &vr.cells {
-        let style = if selected(cell.col) { cell.style.add_modifier(Modifier::REVERSED) } else { cell.style };
+        let style = if cell.solid && current(cell.col) {
+            cell.style.patch(lit_here)
+        } else if selected(cell.col) {
+            cell.style.add_modifier(Modifier::REVERSED)
+        } else if cell.solid && marked(cell.col) {
+            cell.style.patch(lit)
+        } else {
+            cell.style
+        };
         if style != run_style && !run.is_empty() {
             spans.push(Span::styled(std::mem::take(&mut run), run_style));
         }
@@ -573,6 +597,32 @@ pub fn human(bytes: usize) -> String {
         1024..1_048_576 => format!("{} KB", bytes / 1024),
         _ => format!("{:.1} MB", bytes as f64 / 1_048_576.0),
     }
+}
+
+/// Ctrl+F: the search takes the footer's place, so the text stays in view.
+fn draw_find(f: &mut Frame, find: &Find, status: Rect, hints: Rect) {
+    let look = theme::get();
+    let key = Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD);
+    let prompt = "Find  ";
+    let count = find.count();
+    let count_style = if find.current.is_none() && !find.query.is_empty() { Style::new().fg(Color::Red) } else { look.muted() };
+    // A long query shows its end, where the typing is.
+    let room = (status.width as usize).saturating_sub(prompt.len() + count.chars().count() + 3);
+    let typed = find.query.chars().count();
+    let query: String = if typed > room { find.query.chars().skip(typed - room).collect() } else { find.query.clone() };
+    let shown = unicode_width::UnicodeWidthStr::width(query.as_str());
+    let line = Line::from(vec![Span::styled(prompt, Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD)), Span::raw(query)]);
+    f.render_widget(Paragraph::new(line).style(look.surface()), status);
+    let count_w = count.chars().count() as u16;
+    f.render_widget(Paragraph::new(Line::styled(count, count_style)).style(look.surface()), Rect::new(status.x + status.width.saturating_sub(count_w), status.y, count_w.min(status.width), 1));
+    f.set_cursor_position(((status.x + (prompt.len() + shown) as u16).min(status.x + status.width.saturating_sub(1)), status.y));
+
+    let mut spans = Vec::new();
+    for (name, label) in [("Enter", "next"), ("↑↓", "previous / next"), ("^U", "clear"), ("Esc", "done")] {
+        spans.push(Span::styled(name, key));
+        spans.push(Span::styled(format!(" {label}   "), look.muted()));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)).style(look.surface()), hints);
 }
 
 /// Returns where the "go back" label landed, so a click can find it.

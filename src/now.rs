@@ -189,6 +189,10 @@ pub fn describe(at: &Looking) -> String {
              The user's quick notes collect in {}{}. Lines sit under a heading per day:\n\n    ## 2026-09-20\n    - 14:02 call the dentist\n\n\
              - Asked to note something down, remember something or add to the inbox: run `omanote --capture \"the text\"`, \
              which keeps that format (or add a line in that format yourself).\n\
+             - Asked to be reminded of something: the same command with the time last, after a `!`: \
+             `omanote --capture \"call the dentist !tomorrow 9:00\"`. Also `!30m`, `!fri 10:00`, `!2026-09-25 14:00`, and \
+             for what repeats `!every mon 3pm, tue 1pm` or `!every weekday 9:30`. It answers with the time it understood: \
+             pass that on. `omanote --reminders` lists what is coming; deleting a reminder's line in the inbox cancels it.\n\
              - Asked what is in the inbox, or what they jotted down: read that file.\n",
             inbox.display(),
             if inbox.exists() { "" } else { " (not created yet: the first capture makes it)" }
@@ -241,7 +245,7 @@ mod tests {
         let inbox = Path::new("/v/docs/inbox.md");
         let text = describe(&Looking { inbox: Some(inbox), ..at });
         assert!(text.starts_with("# omanote: live context") && text.contains("read it again at the start of every request"));
-        assert!(text.contains("## Inbox") && text.contains("/v/docs/inbox.md (not created yet") && text.contains("omanote --capture"));
+        assert!(text.contains("## Inbox") && text.contains("/v/docs/inbox.md (not created yet") && text.contains("omanote --capture") && text.contains("!every mon 3pm, tue 1pm"));
         assert!(text.find("## Now") < text.find("## Selected text") && text.find("## Selected text") < text.find("## Inbox"));
     }
 
