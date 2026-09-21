@@ -48,6 +48,9 @@ impl Find {
     pub fn open(ed: &Editor, last: &str) -> Self {
         let selected = ed.selected_text().filter(|t| !t.contains('\n') && !t.trim().is_empty() && t.chars().count() <= 80);
         let origin = ed.selection().map_or(ed.cursor, |(start, _)| start);
+        // Standing on a match of the last search (F3 again, or a line opened from
+        // `>words`): that search carries on as it was typed, capitals and all.
+        let selected = selected.filter(|s| s.to_lowercase() != last.to_lowercase());
         Find { query: selected.unwrap_or_else(|| last.to_string()), matches: Vec::new(), current: None, origin }
     }
 
@@ -173,6 +176,7 @@ mod tests {
         assert_eq!(find.query, "ryokan");
         find.refresh(&mut ed);
         assert_eq!(find.count(), "1 of 1", "the selection itself is the first match");
+        assert_eq!(Find::open(&ed, "RYOKAN").query, "RYOKAN", "on a match of the last search: carry on with it as typed");
         ed.clear_selection();
         assert_eq!(Find::open(&ed, "older").query, "older");
         ed.select_all();

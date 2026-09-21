@@ -80,6 +80,10 @@ The mouse works too: click, drag to select, double-click a word, scroll, click a
 
 Case is ignored until you type a capital: `japan` finds `Japan` and `JAPAN`, `Japan` finds only that. With a few words selected, `Ctrl+F` starts on them. `F3` and `Shift+F3` search again for the last thing you looked for. Text that markdown hides, such as the address inside a link, is found too, and shows itself when the search lands on it. It works the same in plain-text files, and with two notes open it searches the one that has the keyboard.
 
+#### Searching inside every note
+
+In `Ctrl+P`, start with `>` and the search is for what your notes say instead of what they are called: `>kyoto rail` lists every line, in every vault, that has both words in it, newest notes first, with the words lit and the note and line number beside it. `Enter` opens the note on that line with the match selected, and `F3` carries on to the next one inside the note. As in `Ctrl+F`, case is ignored until you type a capital. Two letters are needed before it starts; pasted images and files over 4 MB are not searched; the first 200 lines are listed. The notes are read once, when you first type `>`, so every letter after that is instant. It works in `@` too: `@>ryokan` finds a note by what it says and links it. The Omarchy search popup (`Super+N`) does the same: type `>kyoto rail` there and `Enter` opens the note on that line, which on the command line is `omanote <file> --line 12 --match kyoto`.
+
 ### Linking notes
 
 Type `@` and start typing a name. A list of matching notes from your vaults opens under the cursor and narrows as you type; its last entry is always **Create “name.md”**, for a note that does not exist yet. `↑` `↓` choose, `Enter` turns the `@name` into a link, `Esc` (or just carrying on with your sentence) closes the list. An `@` in the middle of a word, such as an e-mail address, does nothing.

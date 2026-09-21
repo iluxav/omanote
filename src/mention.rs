@@ -78,7 +78,8 @@ impl Mention {
         let folder = folder(note, vaults);
         let link = |to: &Path| if self.bare { target(&folder, to) } else { link(&folder, to) };
         match self.picker.row(self.picker.selected).ok_or("Nothing to link to")? {
-            Row::Note(found, _) => Ok(Accepted { link: link(&found.path), create: None }),
+            // `@>words` finds the note by what it says; the link is to the note all the same.
+            Row::Note(found, _) | Row::Line(found, _) => Ok(Accepted { link: link(&found.path), create: None }),
             Row::Create(name) => {
                 let inside = Path::new(&name).components().all(|c| matches!(c, Component::Normal(_)));
                 if !inside {
@@ -336,7 +337,7 @@ mod tests {
     fn rows(m: &Mention) -> Vec<String> {
         (0..m.picker.len())
             .map(|i| match m.picker.row(i).unwrap() {
-                Row::Note(n, _) => n.name.iter().collect(),
+                Row::Note(n, _) | Row::Line(n, _) => n.name.iter().collect(),
                 Row::Create(name) => format!("create {name}.md"),
             })
             .collect()

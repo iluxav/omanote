@@ -13,7 +13,7 @@ use crate::find::Find;
 use crate::layout::{VRow, locate};
 use crate::mention::Mention;
 use crate::pane::Pane;
-use crate::picker::{Note, Picker, Row, age};
+use crate::picker::{LineHit, Note, Picker, Row, age};
 use crate::saveas::{After, SaveAs};
 use crate::theme;
 use crate::vaults::tilde;
@@ -482,6 +482,37 @@ fn note_name(note: &Note, hits: &[usize]) -> Vec<Span<'static>> {
         .collect()
 }
 
+/// A line found inside a note: the line, with what matched lit, and on the
+/// right which note and line it is. A long line is shown from just before its
+/// first match, and cut to fit, so the match is always on screen.
+fn found_line(note: &Note, hit: &LineHit, w: u16) -> (Vec<Span<'static>>, String) {
+    let name: String = note.name.iter().collect();
+    let place = format!("{name}:{}", hit.line + 1);
+    let count = place.chars().count();
+    let place = if count > 30 { format!("…{}", place.chars().skip(count - 29).collect::<String>()) } else { place };
+    let room = (w as usize).saturating_sub(place.chars().count() + 6).max(10);
+
+    let chars: Vec<char> = hit.text.chars().collect();
+    let lead = chars.iter().take_while(|c| c.is_whitespace()).count();
+    let first = hit.marks.first().map_or(lead, |m| m.0);
+    let from = if first + 12 > lead + room { first.saturating_sub(room / 3) } else { lead };
+    let to = (from + room - (from > lead) as usize).min(chars.len());
+    let lit = Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+    let mut spans = Vec::new();
+    if from > lead {
+        spans.push(Span::styled("…", theme::get().muted()));
+    }
+    for (k, c) in chars.iter().enumerate().take(to).skip(from) {
+        let matched = hit.marks.iter().any(|&(a, b)| (a..b).contains(&k));
+        let c = if c.is_control() { ' ' } else { *c };
+        spans.push(Span::styled(c.to_string(), if matched { lit } else { Style::default() }));
+    }
+    if to < chars.len() {
+        spans.push(Span::styled("…", theme::get().muted()));
+    }
+    (spans, place)
+}
+
 /// The `@` suggestions: a short list hanging from the cursor. The note keeps
 /// the keyboard, so nothing is dimmed and the cursor stays where it is.
 fn draw_mention(f: &mut Frame, m: &Mention, cursor: (u16, u16), area: Rect) {
@@ -506,6 +537,8 @@ fn draw_mention(f: &mut Frame, m: &Mention, cursor: (u16, u16), area: Rect) {
         let (text, note) = match p.row(i) {
             Some(Row::Note(note, hits)) => (note_name(note, hits), age(note.modified)),
             Some(Row::Create(name)) => (vec![Span::styled(format!("+ Create “{name}.md”"), Style::new().fg(Color::Green))], String::new()),
+            Some(Row::Line(note, hit)) => found_line(note, hit, w - 2),
+            None if p.in_contents().is_some() => (vec![Span::styled("No note says that", look.muted())], String::new()),
             None => (vec![Span::styled("No notes yet: type a name", look.muted())], String::new()),
         };
         lines.push(list_row(i == p.selected && p.row(i).is_some(), text, note, w - 2));
@@ -526,8 +559,14 @@ fn draw_picker(f: &mut Frame, p: &Picker, area: Rect) {
     let place = p.title();
     let count = place.chars().count();
     let place = if count > room { format!("…{}", place.chars().skip(count - room + 1).collect::<String>()) } else { place };
-    let hints = [("↑↓", "select"), ("Enter", "open"), ("Esc", "cancel"), ("^U", "clear")];
-    let inner = popup(f, area, "Open note", &format!("{place} · {notes}"), &hints, shown as u16 + 2, width);
+    let hints = [("↑↓", "select"), ("Enter", "open"), ("Esc", "cancel"), ("^U", "clear"), (">", "search inside")];
+    // `>words` looks inside the notes: say how much was found instead of how much there is.
+    let (title, notes) = match p.in_contents() {
+        Some(_) if p.too_short() => ("Search in notes", notes),
+        Some(_) => ("Search in notes", format!("{}{} line{}", p.len(), if p.more { "+" } else { "" }, if p.len() == 1 { "" } else { "s" })),
+        None => ("Open note", notes),
+    };
+    let inner = popup(f, area, title, &format!("{place} · {notes}"), &hints, shown as u16 + 2, width);
     let w = inner.width;
 
     let prompt = " ›  ";
@@ -542,6 +581,9 @@ fn draw_picker(f: &mut Frame, p: &Picker, area: Rect) {
         let (text, note) = match p.row(i) {
             Some(Row::Note(note, hits)) => (note_name(note, hits), age(note.modified)),
             Some(Row::Create(name)) => (vec![Span::styled(format!("+ New note “{name}”"), Style::new().fg(Color::Green))], String::new()),
+            Some(Row::Line(note, hit)) => found_line(note, hit, w),
+            None if p.too_short() => (vec![Span::styled("Searching inside your notes: type a word", look.muted())], String::new()),
+            None if p.in_contents().is_some() => (vec![Span::styled("No note says that", look.muted())], String::new()),
             None => {
                 let msg = if p.total() == 0 { "No notes yet — type a name and press Enter" } else { "Nothing matches" };
                 (vec![Span::styled(msg, look.muted())], String::new())

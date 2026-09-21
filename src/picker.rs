@@ -6,6 +6,12 @@ use std::time::SystemTime;
 use crate::vaults::{Vault, tilde};
 
 const MAX_NOTES: usize = 10_000;
+/// Searching inside notes: how many lines are listed, and what is not read at
+/// all. A pasted screenshot is one enormous line of base64; nobody searches that.
+const MAX_LINES: usize = 200;
+const MAX_FILE: u64 = 4 * 1024 * 1024;
+const MAX_LINE: usize = 2000;
+const MIN_WORDS: usize = 2;
 const MAX_DEPTH: usize = 8;
 const VAULT_TYPES: [&str; 2] = ["md", "markdown"];
 /// The current folder is not a vault, so plain text files there count as notes too.
@@ -29,6 +35,27 @@ pub struct Hit {
 pub enum Row<'a> {
     Note(&'a Note, &'a [usize]),
     Create(String),
+    /// `>words`: a line of a note that has the words in it.
+    Line(&'a Note, &'a LineHit),
+}
+
+/// A line found by searching inside the notes.
+pub struct LineHit {
+    note: usize,
+    /// Counted from 0.
+    pub line: usize,
+    pub text: String,
+    /// What matched, as character ranges of `text`.
+    pub marks: Vec<(usize, usize)>,
+}
+
+/// What Enter on a found line needs besides the note: the line, and the match to land on.
+pub struct Found {
+    pub line: usize,
+    pub text: String,
+    pub mark: (usize, usize),
+    /// The first word searched for, so F3 can carry on inside the note.
+    pub term: String,
 }
 
 pub struct Picker {
@@ -38,6 +65,12 @@ pub struct Picker {
     pub selected: usize,
     notes: Vec<Note>,
     hits: Vec<Hit>,
+    /// `>words` searches inside the notes. Their text is read once, the first
+    /// time it is needed: (line number, line) for every line worth searching.
+    texts: Option<Vec<Vec<(usize, String)>>>,
+    lines: Vec<LineHit>,
+    /// There were more matching lines than are kept.
+    pub more: bool,
 }
 
 /// What `omanote <words>` on the command line should do.
@@ -99,13 +132,82 @@ impl Picker {
         }
         notes.sort_by(|a, b| b.modified.cmp(&a.modified).then_with(|| a.name.cmp(&b.name)));
         let roots = vaults.iter().map(|v| v.path.clone()).collect();
-        let mut picker = Picker { roots, query: String::new(), selected: 0, notes, hits: Vec::new() };
+        let mut picker = Picker { roots, query: String::new(), selected: 0, notes, hits: Vec::new(), texts: None, lines: Vec::new(), more: false };
         picker.refresh();
         picker
     }
 
+    /// `>words`: the query is for what the notes say, not what they are called.
+    pub fn in_contents(&self) -> Option<&str> {
+        self.query.strip_prefix('>').map(str::trim)
+    }
+
+    /// Too short to search for yet.
+    pub fn too_short(&self) -> bool {
+        self.in_contents().is_some_and(|q| q.chars().count() < MIN_WORDS)
+    }
+
+    fn read_notes(&mut self) {
+        if self.texts.is_some() {
+            return;
+        }
+        let read = |note: &Note| -> Vec<(usize, String)> {
+            if std::fs::metadata(&note.path).map_or(true, |m| m.len() > MAX_FILE) {
+                return Vec::new();
+            }
+            let text = std::fs::read_to_string(&note.path).unwrap_or_default();
+            text.lines().enumerate().filter(|(_, l)| !l.trim().is_empty() && l.len() <= MAX_LINE).map(|(i, l)| (i, l.to_string())).collect()
+        };
+        self.texts = Some(self.notes.iter().map(read).collect());
+    }
+
+    /// Lines that have every word of the query in them, newest notes first.
+    /// Case counts only once a capital has been typed, as in Ctrl+F.
+    fn search_contents(&mut self) {
+        self.hits.clear();
+        self.lines.clear();
+        self.more = false;
+        self.selected = 0;
+        let query = self.in_contents().unwrap_or("").to_string();
+        if query.chars().count() < MIN_WORDS {
+            return;
+        }
+        self.read_notes();
+        let exact = query.chars().any(char::is_uppercase);
+        let words: Vec<String> = query.split_whitespace().map(|w| if exact { w.to_string() } else { w.to_lowercase() }).collect();
+        let Some(texts) = &self.texts else { return };
+        'notes: for (note, lines) in texts.iter().enumerate() {
+            for (line, text) in lines {
+                let folded = if exact { std::borrow::Cow::Borrowed(text.as_str()) } else { std::borrow::Cow::Owned(text.to_lowercase()) };
+                if !words.iter().all(|w| folded.contains(w.as_str())) {
+                    continue;
+                }
+                if self.lines.len() == MAX_LINES {
+                    self.more = true;
+                    break 'notes;
+                }
+                let chars: Vec<char> = text.chars().collect();
+                let mut marks: Vec<(usize, usize)> = words.iter().flat_map(|w| crate::find::search(std::slice::from_ref(&chars), w)).map(|(_, from, to)| (from, to)).collect();
+                marks.sort_unstable();
+                self.lines.push(LineHit { note, line: *line, text: text.clone(), marks });
+            }
+        }
+    }
+
+    /// What Enter opens when a found line is selected.
+    pub fn found(&self) -> Option<Found> {
+        let hit = self.in_contents().and_then(|_| self.lines.get(self.selected))?;
+        let term = self.in_contents()?.split_whitespace().next()?.to_string();
+        let mark = hit.marks.first().copied().unwrap_or((0, 0));
+        Some(Found { line: hit.line, text: hit.text.clone(), mark, term })
+    }
+
     /// Re-rank after the query changed. Every whitespace-separated term has to match.
     fn refresh(&mut self) {
+        if self.in_contents().is_some() {
+            return self.search_contents();
+        }
+        self.lines.clear();
         let terms: Vec<Vec<char>> =
             self.query.split_whitespace().map(|t| t.chars().flat_map(|c| c.to_lowercase()).collect()).collect();
         let mut scored: Vec<(i32, Hit)> = Vec::new();
@@ -160,6 +262,9 @@ impl Picker {
 
     /// Offer to create the note when nothing is named exactly what was typed.
     fn create_name(&self) -> Option<String> {
+        if self.in_contents().is_some() {
+            return None;
+        }
         let name = self.query.trim().trim_end_matches(".md").trim();
         let exists = self.notes.iter().any(|n| n.lower.iter().copied().eq(name.chars().flat_map(|c| c.to_lowercase())));
         (!name.is_empty() && !exists).then(|| name.to_string())
@@ -174,6 +279,9 @@ impl Picker {
     }
 
     pub fn len(&self) -> usize {
+        if self.in_contents().is_some() {
+            return self.lines.len();
+        }
         self.hits.len() + self.create_name().is_some() as usize
     }
 
@@ -182,6 +290,9 @@ impl Picker {
     }
 
     pub fn row(&self, i: usize) -> Option<Row<'_>> {
+        if self.in_contents().is_some() {
+            return self.lines.get(i).map(|hit| Row::Line(&self.notes[hit.note], hit));
+        }
         match self.hits.get(i) {
             Some(hit) => Some(Row::Note(&self.notes[hit.note], &hit.positions)),
             None if i == self.hits.len() => self.create_name().map(Row::Create),
@@ -194,6 +305,7 @@ impl Picker {
         match self.row(self.selected)? {
             Row::Note(note, _) => Some(note.path.clone()),
             Row::Create(name) => Some(self.roots.first()?.join(format!("{name}.md"))),
+            Row::Line(note, _) => Some(note.path.clone()),
         }
     }
 
@@ -253,7 +365,8 @@ impl Picker {
 
     pub fn delete_word(&mut self) {
         let trimmed = self.query.trim_end();
-        let cut = trimmed.rfind(char::is_whitespace).map_or(0, |i| i + 1);
+        let keep = if trimmed.len() > 1 && trimmed.starts_with('>') { 1 } else { 0 };
+        let cut = trimmed.rfind(char::is_whitespace).map_or(keep, |i| i + 1);
         self.query.truncate(cut);
         self.refresh();
     }
@@ -286,16 +399,43 @@ fn json_string(text: &str) -> String {
 pub fn find_json(vaults: &[Vault], query: &str, limit: usize) -> String {
     let mut picker = Picker::open(vaults);
     picker.push(query);
-    let mut rows = Vec::new();
-    for hit in picker.hits.iter().take(limit) {
-        let note = &picker.notes[hit.note];
+    let place = |note: &Note| {
         let vault = vaults.iter().filter(|v| note.path.starts_with(&v.path)).max_by_key(|v| v.path.as_os_str().len());
-        let (name, place) = match vault {
+        match vault {
             Some(v) => (note.path.strip_prefix(&v.path).unwrap_or(&note.path).with_extension(""), tilde(&v.path)),
             None => (note.path.with_extension(""), String::new()),
-        };
+        }
+    };
+    let mut rows = Vec::new();
+    // `>words`: lines found inside the notes. `line` counts from 1, and `term`
+    // is what to look for on it: `omanote <path> --line <line> --match <term>`.
+    if let Some(words) = picker.in_contents() {
+        let term = words.split_whitespace().next().unwrap_or("");
+        for hit in picker.lines.iter().take(limit) {
+            let note = &picker.notes[hit.note];
+            let (name, place) = place(note);
+            let around = around_match(&hit.text, term);
+            rows.push(format!(
+                "{{\"kind\":\"line\",\"path\":{},\"name\":{},\"where\":{},\"age\":{},\"line\":{},\"text\":{},\"before\":{},\"hit\":{},\"after\":{},\"term\":{}}}",
+                json_string(&note.path.to_string_lossy()),
+                json_string(&name.to_string_lossy()),
+                json_string(&place),
+                json_string(&age(note.modified)),
+                hit.line + 1,
+                json_string(&snippet(hit, 110)),
+                json_string(&around.0),
+                json_string(&around.1),
+                json_string(&around.2),
+                json_string(term)
+            ));
+        }
+        return format!("[{}]", rows.join(","));
+    }
+    for hit in picker.hits.iter().take(limit) {
+        let note = &picker.notes[hit.note];
+        let (name, place) = place(note);
         rows.push(format!(
-            "{{\"path\":{},\"name\":{},\"where\":{},\"age\":{}}}",
+            "{{\"kind\":\"note\",\"path\":{},\"name\":{},\"where\":{},\"age\":{}}}",
             json_string(&note.path.to_string_lossy()),
             json_string(&name.to_string_lossy()),
             json_string(&place),
@@ -303,6 +443,108 @@ pub fn find_json(vaults: &[Vault], query: &str, limit: usize) -> String {
         ));
     }
     format!("[{}]", rows.join(","))
+}
+
+/// A line of markdown as the words a person would read: no bullets, heading
+/// marks or quote marks in front, a table row as its cells, links as their
+/// text, and none of the `**`, backticks and the like.
+pub fn plain(line: &str) -> String {
+    let mut text = line.trim();
+    loop {
+        let before = text;
+        for mark in ["- [ ] ", "- [x] ", "- [X] ", "- ", "* ", "+ ", "> ", "#"] {
+            text = text.strip_prefix(mark).unwrap_or(text).trim_start();
+        }
+        // 1. 2. 3.
+        let digits = text.chars().take_while(char::is_ascii_digit).count();
+        if digits > 0 && digits < 4 {
+            text = text[digits..].strip_prefix(". ").or_else(|| text[digits..].strip_prefix(") ")).unwrap_or(text);
+        }
+        if text == before {
+            break;
+        }
+    }
+    let text = if text.starts_with('|') {
+        let cells: Vec<&str> = text.split('|').map(str::trim).filter(|c| !c.is_empty() && !c.chars().all(|ch| "-: ".contains(ch))).collect();
+        cells.join("  ·  ")
+    } else {
+        text.to_string()
+    };
+
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let rest = &chars[i..];
+        // [[note|shown]], [text](target), ![alt](target): what is shown, not where it goes.
+        if rest.starts_with(&['[', '[']) {
+            if let Some(end) = rest.windows(2).position(|w| w == [']', ']']) {
+                let inner: String = rest[2..end].iter().collect();
+                out.push_str(inner.rsplit('|').next().unwrap_or(&inner));
+                i += end + 2;
+                continue;
+            }
+        }
+        let bracket = if rest.starts_with(&['!', '[']) { 1 } else { 0 };
+        if rest.get(bracket) == Some(&'[') {
+            let close = rest.iter().position(|c| *c == ']');
+            let target = close.filter(|&c| matches!(rest.get(c + 1), Some('(' | '['))).and_then(|c| {
+                let closer = if rest[c + 1] == '(' { ')' } else { ']' };
+                rest[c + 2..].iter().position(|ch| *ch == closer).map(|e| (c, c + 2 + e))
+            });
+            if let Some((close, end)) = target {
+                out.extend(&rest[bracket + 1..close]);
+                i += end + 1;
+                continue;
+            }
+        }
+        match rest[0] {
+            '*' | '`' | '~' => {}
+            // _emphasis_ goes; the underscore inside snake_case is part of the word.
+            '_' if !(i > 0 && chars[i - 1].is_alphanumeric() && rest.get(1).is_some_and(|c| c.is_alphanumeric())) => {}
+            c if c.is_control() => out.push(' '),
+            c => out.push(c),
+        }
+        i += 1;
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ").replace(" · ", "  ·  ")
+}
+
+/// A found line for the desktop popup, which shows plain text: what comes
+/// before the match, the match, and what follows, cut so the match is near
+/// the front. The spaces where the three meet are no-break ones: a text
+/// field trims ordinary spaces at its ends, and the words would run together.
+pub fn around_match(line: &str, term: &str) -> (String, String, String) {
+    const BEFORE: usize = 28;
+    const AFTER: usize = 120;
+    let chars: Vec<char> = plain(line).chars().collect();
+    let cut = |chars: &[char]| chars.iter().take(AFTER).collect::<String>() + if chars.len() > AFTER { "…" } else { "" };
+    // The match may have been in something that is not shown (a link's address).
+    let Some(&(_, from, to)) = crate::find::search(std::slice::from_ref(&chars), term).first() else {
+        return (String::new(), String::new(), cut(&chars));
+    };
+    let start = if from > BEFORE { from - BEFORE + 1 } else { 0 };
+    let mut before: String = chars[start..from].iter().collect();
+    if start > 0 {
+        before = format!("…{}", before.trim_start());
+    }
+    let edge = |text: String| match (text.strip_suffix(' '), text.strip_prefix(' ')) {
+        (Some(rest), _) => format!("{rest}\u{a0}"),
+        (_, Some(rest)) => format!("\u{a0}{rest}"),
+        _ => text,
+    };
+    (edge(before), chars[from..to].iter().collect(), edge(cut(&chars[to..])))
+}
+
+/// A found line as plain text that fits in `room`: from just before its first
+/// match when the line is long, so the match is always in it.
+pub fn snippet(hit: &LineHit, room: usize) -> String {
+    let chars: Vec<char> = hit.text.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+    let lead = chars.iter().take_while(|c| c.is_whitespace()).count();
+    let first = hit.marks.first().map_or(lead, |m| m.0);
+    let from = if first + 12 > lead + room { first.saturating_sub(room / 3) } else { lead };
+    let to = (from + room).min(chars.len());
+    format!("{}{}{}", if from > lead { "…" } else { "" }, chars[from..to].iter().collect::<String>(), if to < chars.len() { "…" } else { "" })
 }
 
 const MATCH: i32 = 1;
@@ -406,6 +648,16 @@ mod tests {
         assert!(score("todo", "work/todo") > score("todo", "todo-list/work notes"));
         assert!(score("mi", "my ideas") > score("mi", "swimming"));
         assert!(score("plan", "plan") > score("plan", "planning for next year"));
+    }
+
+    trait TapDir {
+        fn tap_dir(self) -> Self;
+    }
+    impl TapDir for PathBuf {
+        fn tap_dir(self) -> Self {
+            std::fs::create_dir_all(self.parent().unwrap()).unwrap();
+            self
+        }
     }
 
     fn temp_vault(names: &[&str]) -> PathBuf {
@@ -568,6 +820,83 @@ mod tests {
         assert_eq!(names("work/ideas"), ["work/ideas.md"], "a folder narrows it, and homework is not work");
         assert!(names("nothing").is_empty());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_query_starting_with_an_angle_searches_inside_the_notes() {
+        let root = temp_vault(&["ideas.md"]);
+        std::fs::write(root.join("trips/japan.md").tap_dir(), "# Japan\n\nBook the ryokan in Kyoto.\nRail pass for Kyoto and Osaka\n").unwrap();
+        std::fs::write(root.join("food.md"), "best ramen: kyoto station\n![shot][s]\n\n[s]: data:image/png;base64,".to_string() + &"kyoto".repeat(1000)).unwrap();
+        let mut p = Picker::open(&[Vault { path: root.clone(), github: None }]);
+        let rows = |p: &Picker| {
+            (0..p.len())
+                .map(|i| match p.row(i).unwrap() {
+                    Row::Line(note, hit) => format!("{}:{} {}", note.name.iter().collect::<String>(), hit.line + 1, hit.text),
+                    _ => panic!("not a line"),
+                })
+                .collect::<Vec<_>>()
+        };
+
+        p.push(">k");
+        assert!(p.too_short() && p.len() == 0, "one letter would match the world");
+        p.push("yoto");
+        let mut found = rows(&p);
+        found.sort();
+        assert_eq!(found, ["food:1 best ramen: kyoto station", "trips/japan:3 Book the ryokan in Kyoto.", "trips/japan:4 Rail pass for Kyoto and Osaka"], "every note, but not the pasted image");
+
+        p.push(" rail");
+        assert_eq!(rows(&p), ["trips/japan:4 Rail pass for Kyoto and Osaka"], "every word, in any order");
+        let hit = p.found().unwrap();
+        assert_eq!((hit.line, hit.mark, hit.term.as_str()), (3, (0, 4), "kyoto"));
+        match p.row(0).unwrap() {
+            Row::Line(_, hit) => assert_eq!(hit.marks, [(0, 4), (14, 19)]),
+            _ => unreachable!(),
+        }
+        assert_eq!(p.chosen(), Some(root.join("trips/japan.md")));
+
+        p.clear();
+        p.push(">Kyoto");
+        assert_eq!(p.len(), 2, "a capital: exactly that");
+        p.delete_word();
+        assert_eq!(p.query, ">", "deleting the words keeps the mode");
+        p.clear();
+        p.push("jap");
+        assert!(matches!(p.row(0), Some(Row::Note(..))) && p.found().is_none(), "without the angle it is names again");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_popup_gets_found_lines_too() {
+        let root = temp_vault(&["ideas.md"]);
+        std::fs::write(root.join("trips/japan.md").tap_dir(), format!("# Japan\n\n{}the ryokan in \"Kyoto\" is booked\n", "so ".repeat(60))).unwrap();
+        let vaults = [Vault { path: root.clone(), github: None }];
+        let json = find_json(&vaults, ">ryokan", 60);
+        assert!(json.starts_with("[{\"kind\":\"line\",\"path\":") && json.contains("\"name\":\"trips/japan\"") && json.contains("\"line\":3,"), "{json}");
+        assert!(json.contains("so the ryokan in \\\"Kyoto\\\" is booked\"") && json.contains("\"text\":\"…"), "a long line starts near its match: {json}");
+        assert!(json.ends_with("\"term\":\"ryokan\"}]"), "{json}");
+        assert_eq!(find_json(&vaults, ">zzzz", 60), "[]");
+        assert_eq!(find_json(&vaults, ">", 60), "[]");
+        assert!(find_json(&vaults, "jap", 60).starts_with("[{\"kind\":\"note\","), "names, as before");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn found_lines_read_as_words_not_markdown() {
+        assert_eq!(plain("| GPU | Dedicated VRAM | PCI address |"), "GPU  ·  Dedicated VRAM  ·  PCI address");
+        assert_eq!(plain("| --- | :---: |"), "");
+        assert_eq!(plain("- Reported PCIe links at capture: RTX 8000 at **Gen 3 x16**"), "Reported PCIe links at capture: RTX 8000 at Gen 3 x16");
+        assert_eq!(plain("  - [ ] Hard Disk - [Samsung 990 PRO 2TB](https://example.com/990) `nvme0`"), "Hard Disk - Samsung 990 PRO 2TB nvme0");
+        assert_eq!(plain("## 3. The _plan_ for [[trips/japan|Japan]] and ![a map](map.png)"), "The plan for Japan and a map");
+        assert_eq!(plain("> 12. see [docs][d], snake_case stays"), "see docs, snake_case stays");
+        assert_eq!(plain("plain words"), "plain words");
+
+        assert_eq!(around_match("- Reported PCIe links at capture", "pc"), ("Reported\u{a0}".into(), "PC".into(), "Ie links at capture".into()));
+        let long = format!("{} the ryokan is booked", "word ".repeat(20));
+        let (before, hit, after) = around_match(&long, "ryokan");
+        assert!(before.starts_with('…') && before.chars().count() <= 28 && before.ends_with("the\u{a0}"), "{before:?}");
+        assert_eq!((hit.as_str(), after.as_str()), ("ryokan", "\u{a0}is booked"));
+        // Found in a link's address, which is not shown: the line, with nothing picked out.
+        assert_eq!(around_match("see [the plan](trips/japan.md)", "japan"), (String::new(), String::new(), "see the plan".into()));
     }
 
 }

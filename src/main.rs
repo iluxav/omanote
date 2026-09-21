@@ -655,9 +655,15 @@ impl App {
         match key.code {
             KeyCode::Esc => self.picker = None,
             KeyCode::Enter => {
+                let found = p.found();
                 if let Some(path) = p.chosen() {
                     self.picker = None;
-                    self.open(path);
+                    self.open(path.clone());
+                    // A line found by `>words`: land on it, with the match selected, and
+                    // let F3 carry on looking for the same word inside the note.
+                    if let Some(found) = found.filter(|_| self.ed.path.as_ref() == Some(&path)) {
+                        self.land_on(&found);
+                    }
                 }
             }
             KeyCode::Up | KeyCode::BackTab => p.step(-1),
@@ -688,6 +694,33 @@ impl App {
         self.note_saves();
         self.sync.flush();
         self.quit = true;
+    }
+
+    /// `--line 12 --match kyoto`: the cursor goes to that line, and if the word
+    /// is given, onto the nearest place it occurs, selected, with F3 primed to
+    /// find the next. (Nearest, not "on that line": pasted images are kept out
+    /// of the editor's lines, so the file's line 12 may be the editor's 11.)
+    fn land_at(&mut self, line: usize, word: &str) {
+        let want = line.saturating_sub(1).min(self.ed.lines.len() - 1);
+        let nearest = find::search(&self.ed.lines, word).into_iter().min_by_key(|hit| hit.0.abs_diff(want));
+        match nearest {
+            Some((row, from, to)) => {
+                self.ed.move_to(Pos { row, col: from }, false);
+                self.ed.move_to(Pos { row, col: to }, true);
+                self.last_find = word.to_string();
+            }
+            None => self.ed.move_to(Pos { row: want, col: 0 }, false),
+        }
+    }
+
+    fn land_on(&mut self, found: &picker::Found) {
+        let is_it = |row: usize| self.ed.lines.get(row).is_some_and(|l| l.iter().collect::<String>() == found.text);
+        // Pasted images are kept out of the editor's lines, so a line may sit
+        // a little higher here than it does in the file: look for its text.
+        let Some(row) = (is_it(found.line)).then_some(found.line).or_else(|| (0..self.ed.lines.len()).find(|&r| is_it(r))) else { return };
+        self.ed.move_to(Pos { row, col: found.mark.0 }, false);
+        self.ed.move_to(Pos { row, col: found.mark.1 }, true);
+        self.last_find = found.term.clone();
     }
 
     fn quit(&mut self) {
@@ -1278,10 +1311,12 @@ omanote — a small markdown note editor
                               one match opens, several are listed (Tab, Enter),
                               none starts a new note. Case and .md do not matter.
   omanote <path/to/file.md>   open (or start) that file
+  omanote <file> --line 12    …with the cursor on that line (--match word: on that word)
   omanote <note> --agent      …with the AI agent menu open (--agent=codex: that agent)
   omanote --demo              a note that shows off what the editor renders
   Ctrl+N inside the editor    start a new note (asks to save an unnamed one first)
-  Ctrl+P inside the editor    fuzzy-find a note in any vault
+  Ctrl+P inside the editor    fuzzy-find a note in any vault; start with > to search inside
+                              the notes instead (>kyoto rail), Enter opens it on that line
   F2 inside the editor        move, rename or copy the note (another vault, another folder)
   Ctrl+F inside the editor    find in the note: matches light up as you type, Enter or
                               the arrows move between them, Esc leaves you on the match.
@@ -1364,11 +1399,16 @@ fn target(words: &[String]) -> Target {
 }
 
 /// Handle the flags that do their job and exit. Returns what is left: the note to open.
-fn cli(args: &[String]) -> Result<(Target, bool, bool, Option<String>), String> {
+/// Where to put the cursor in the note that opens: a line (from 1), and a word to select on it.
+type Land = Option<(usize, String)>;
+
+fn cli(args: &[String]) -> Result<(Target, bool, bool, Option<String>, Land), String> {
     let home = vaults::home();
     let (mut words, mut keys, mut demo) = (Vec::new(), false, false);
     // `--agent`: open the assistant straight away ("" = ask which); `--agent=codex`: that one.
     let mut agent: Option<String> = None;
+    // `--line 12 --match kyoto`: how the desktop popup opens a line it found.
+    let (mut line, mut word) = (None, String::new());
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         let mut value = |what: &str| it.next().cloned().ok_or(format!("{arg} needs {what}"));
@@ -1385,7 +1425,7 @@ fn cli(args: &[String]) -> Result<(Target, bool, bool, Option<String>), String> 
             "--new" => {
                 // A new note no matter what exists; the words become its suggested name.
                 let name: Vec<String> = it.by_ref().cloned().collect();
-                return Ok((Target::New(name.join(" ")), keys, demo, agent));
+                return Ok((Target::New(name.join(" ")), keys, demo, agent, None));
             }
             "--capture" => {
                 // Everything after the flag is the note, quoted or not.
@@ -1411,7 +1451,7 @@ fn cli(args: &[String]) -> Result<(Target, bool, bool, Option<String>), String> 
             "--config" => {
                 // Open the settings in the editor itself; saving applies them.
                 let file = config::ensure(&home).map_err(|e| format!("cannot write the config: {e}"))?;
-                return Ok((Target::File(file), keys, demo, agent));
+                return Ok((Target::File(file), keys, demo, agent, None));
             }
             "--sync" => {
                 let ok = sync::sync_all(&home, &vaults::all(&home));
@@ -1424,6 +1464,15 @@ fn cli(args: &[String]) -> Result<(Target, bool, bool, Option<String>), String> 
             }
             "--demo" => {
                 demo = true;
+                continue;
+            }
+            "--line" => {
+                let given = value("a line number")?;
+                line = Some(given.trim_start_matches('+').parse::<usize>().map_err(|_| format!("--line needs a number, not {given}"))?);
+                continue;
+            }
+            "--match" => {
+                word = value("the text to select")?;
                 continue;
             }
             flag if flag == "--agent" || flag.starts_with("--agent=") => {
@@ -1439,7 +1488,7 @@ fn cli(args: &[String]) -> Result<(Target, bool, bool, Option<String>), String> 
         println!("{}", done.trim_end());
         std::process::exit(0);
     }
-    Ok((target(&words), keys, demo, agent))
+    Ok((target(&words), keys, demo, agent, line.map(|l| (l, word))))
 }
 
 /// A note made from an `@` mention: just its title, ready to be written in.
@@ -1461,7 +1510,7 @@ const HISTORY: usize = 50;
 
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args_os().skip(1).map(|a| a.to_string_lossy().into_owned()).collect();
-    let (target, keys, demo, start_agent) = cli(&args).unwrap_or_else(|msg| {
+    let (target, keys, demo, start_agent, land) = cli(&args).unwrap_or_else(|msg| {
         eprintln!("omanote: {msg}");
         std::process::exit(2);
     });
@@ -1582,6 +1631,9 @@ fn main() -> std::io::Result<()> {
     // elsewhere is here by the time it is looked for.
     app.sync.pull_all(&vaults::all(&vaults::home()));
     app.ed = app.editor(&text, path);
+    if let Some((line, word)) = &land {
+        app.land_at(*line, word);
+    }
     if let Some(msg) = greeting {
         app.say(msg);
     }
