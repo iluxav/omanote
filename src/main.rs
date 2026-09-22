@@ -1442,6 +1442,14 @@ impl App {
             KeyCode::End => ed.end(shift),
             KeyCode::Backspace if ctrl || alt => ed.delete_word_back(),
             KeyCode::Backspace => ed.backspace(),
+            // The other copy, cut and paste: Ctrl+Insert, Shift+Delete, Shift+Insert.
+            // Omarchy's Super+C and Super+V send these to terminals.
+            KeyCode::Insert if ctrl => {
+                clipboard::copy(&ed.copy());
+                self.say("Copied");
+            }
+            KeyCode::Insert if shift => self.paste_clipboard(),
+            KeyCode::Delete if shift => clipboard::copy(&ed.cut()),
             KeyCode::Delete if ctrl => ed.delete_word_forward(),
             KeyCode::Delete => ed.delete(),
             KeyCode::Enter => ed.enter(),

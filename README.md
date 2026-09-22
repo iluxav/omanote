@@ -222,6 +222,20 @@ For a notes icon in the bar and a quick-capture box, there is a plugin:
 omarchy plugin add https://github.com/iluxav/omarchy-omanote --enable
 ```
 
+**`Super+C` in a terminal.** Omarchy's universal copy sends `Ctrl+Insert` to terminals, and Ghostty takes that to copy its own selection, which in omanote is empty: omanote draws its own. To let the key through when Ghostty has nothing selected, and keep bash from typing `5~` when that happens at a prompt:
+
+```sh
+# ~/.config/ghostty/config (the built-in binding has to be cleared first)
+keybind = ctrl+insert=unbind
+keybind = performable:ctrl+insert=copy_to_clipboard
+
+# ~/.inputrc
+$include /etc/inputrc
+"\e[2;5~": ""
+```
+
+Then `omarchy restart terminal`. `Super+V` works as it is.
+
 `omanote --capture "call the dentist"` is what quick capture runs: it appends a line to `inbox.md` in your default vault, under a heading for the day, without opening the editor.
 
 ### Reminders

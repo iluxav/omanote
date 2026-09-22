@@ -3716,7 +3716,7 @@ dependencies = [
 
 [[package]]
 name = "omanote"
-version = "0.0.16"
+version = "0.0.17"
 dependencies = [
  "candle-core 0.11.0",
  "candle-nn",
