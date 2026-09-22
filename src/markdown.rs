@@ -5,8 +5,9 @@
 //! replacement glyph (bullets, checkboxes, quote bars). The layout step decides
 //! whether to honour `hidden`/`repl` based on whether the line is revealed.
 
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 
+use crate::look::{self, El};
 use crate::table;
 
 pub const CHECK_OPEN: &str = "\u{f0131}";
@@ -43,24 +44,17 @@ pub struct StyledLine {
     pub rule: bool,
 }
 
+/// Markdown's own characters, where they show (the line being edited).
 pub fn marker() -> Style {
-    Style::new().fg(Color::DarkGray)
+    look::of(El::Syntax)
 }
 
 fn heading(level: usize) -> Style {
-    let color = match level {
-        1 => Color::Magenta,
-        2 => Color::Blue,
-        3 => Color::Cyan,
-        4 => Color::Green,
-        _ => Color::Yellow,
-    };
-    let style = Style::new().fg(color).add_modifier(Modifier::BOLD);
-    if level == 1 { style.add_modifier(Modifier::UNDERLINED) } else { style }
+    look::heading(level)
 }
 
 fn link_style() -> Style {
-    Style::new().fg(Color::Blue).add_modifier(Modifier::UNDERLINED)
+    look::of(El::Link)
 }
 
 pub fn indent(chars: &[char]) -> usize {
@@ -244,7 +238,12 @@ pub fn style_line(chars: &[char], block: Block) -> StyledLine {
     };
 
     match block {
-        Block::Plain => return sl,
+        Block::Plain => {
+            for cell in &mut sl.cells {
+                cell.style = look::of(El::Text);
+            }
+            return sl;
+        }
         Block::Comment => {
             for cell in &mut sl.cells {
                 cell.style = crate::theme::get().muted();
@@ -254,7 +253,7 @@ pub fn style_line(chars: &[char], block: Block) -> StyledLine {
         Block::Code => {
             sl.prefix = Some(("│ ", marker()));
             for cell in &mut sl.cells {
-                cell.style = Style::new().fg(Color::Green);
+                cell.style = look::of(El::CodeBlock);
             }
             return sl;
         }
@@ -290,17 +289,18 @@ pub fn style_line(chars: &[char], block: Block) -> StyledLine {
         return sl;
     }
 
-    let mut base = Style::default();
+    // Ordinary text has a style too, and everything else is laid over it.
+    let mut base = look::of(El::Text);
     while i < n && chars[i] == '>' {
         sl.cells[i].repl = Some("▎");
-        sl.cells[i].style = Style::new().fg(Color::Blue);
+        sl.cells[i].style = look::of(El::QuoteBar);
         i += 1;
         if i < n && chars[i] == ' ' {
             i += 1;
         }
         sl.quote = true;
         sl.hang_col = i;
-        base = Style::new().add_modifier(Modifier::ITALIC);
+        base = base.patch(look::of(El::Quote));
     }
 
     if let Some(mark) = task_mark(chars) {
@@ -309,20 +309,20 @@ pub fn style_line(chars: &[char], block: Block) -> StyledLine {
             hide(&mut sl.cells, k);
         }
         sl.cells[mark].repl = Some(if done { CHECK_DONE } else { CHECK_OPEN });
-        sl.cells[mark].style = Style::new().fg(if done { Color::Green } else { Color::Blue });
+        sl.cells[mark].style = look::of(if done { El::TaskDone } else { El::Task });
         if done {
-            base = marker().add_modifier(Modifier::CROSSED_OUT);
+            base = look::of(El::TaskDoneText);
         }
         i = (mark + 3).min(n);
         sl.hang_col = i;
     } else if is_bullet(chars, i) {
         sl.cells[i].repl = Some("•");
-        sl.cells[i].style = Style::new().fg(Color::Blue);
+        sl.cells[i].style = look::of(El::List);
         i += 2;
         sl.hang_col = i;
     } else if let Some((space, _)) = ordered(chars, i) {
         for k in i..space {
-            sl.cells[k].style = Style::new().fg(Color::Blue);
+            sl.cells[k].style = look::of(El::List);
         }
         i = space + 1;
         sl.hang_col = i;
@@ -355,11 +355,11 @@ fn hide(cells: &mut [CharCell], k: usize) {
 
 fn delim_style(c: char, len: usize) -> Style {
     match (c, len) {
-        ('~', _) => Style::new().add_modifier(Modifier::CROSSED_OUT),
-        ('=', _) => Style::new().fg(Color::Black).bg(Color::Yellow),
-        (_, 1) => Style::new().add_modifier(Modifier::ITALIC),
-        (_, 2) => Style::new().add_modifier(Modifier::BOLD),
-        _ => Style::new().add_modifier(Modifier::BOLD | Modifier::ITALIC),
+        ('~', _) => look::of(El::Strike),
+        ('=', _) => look::of(El::Highlight),
+        (_, 1) => look::of(El::Italic),
+        (_, 2) => look::of(El::Bold),
+        _ => look::of(El::Bold).patch(look::of(El::Italic)),
     }
 }
 
@@ -525,7 +525,7 @@ pub fn inline(ch: &[char], start: usize, end: usize, base: Style, cells: &mut [C
                             hide(cells, k);
                         }
                         for cell in &mut cells[i + run..j] {
-                            cell.style = Style::new().fg(Color::Yellow);
+                            cell.style = look::of(El::Code);
                         }
                         i = j + run;
                     }
@@ -575,7 +575,7 @@ pub fn inline(ch: &[char], start: usize, end: usize, base: Style, cells: &mut [C
                     .find(|&k| !(ch[k].is_alphanumeric() || matches!(ch[k], '-' | '_' | '/')))
                     .unwrap_or(end);
                 for cell in &mut cells[i..j] {
-                    cell.style = base.patch(Style::new().fg(Color::Cyan));
+                    cell.style = base.patch(look::of(El::Tag));
                 }
                 i = j;
             }

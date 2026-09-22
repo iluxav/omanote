@@ -8,10 +8,11 @@
 
 use std::ops::Range;
 
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use unicode_width::UnicodeWidthStr;
 
 use crate::layout::{Cell, VRow};
+use crate::look::{self, El};
 use crate::markdown::{CharCell, indent, inline, marker};
 
 const MIN_WIDTH: u16 = 3;
@@ -118,7 +119,8 @@ pub fn aligns(separator: &[char]) -> Vec<Align> {
 
 fn styled(chars: &[char], role: Role) -> Vec<CharCell> {
     let mut out = vec![CharCell::default(); chars.len()];
-    let base = if role == Role::Header { Style::new().add_modifier(Modifier::BOLD) } else { Style::default() };
+    let text = look::of(El::Text);
+    let base = if role == Role::Header { text.patch(look::of(El::TableHeader)) } else { text };
     for cell in cells(chars) {
         if role == Role::Separator {
             for c in &mut out[cell] {
@@ -209,7 +211,7 @@ fn border(chars: &[char], ctx: &Ctx, left: &str, mid: &str, right: &str) -> VRow
     let bars: Vec<String> = ctx.widths.iter().map(|w| "─".repeat(*w as usize)).collect();
     let text = format!("{}{left}{}{right}", " ".repeat(indent(chars)), bars.join(mid));
     let lead_w = text.as_str().width() as u16;
-    VRow { lead: vec![(text, marker())], lead_w, cells: Vec::new(), start: 0, end: 0, last: false, virt: true }
+    VRow { lead: vec![(text, look::of(El::TableBorder))], lead_w, cells: Vec::new(), start: 0, end: 0, last: false, virt: true }
 }
 
 /// Shrink columns so the table fits in `avail` cells of content (borders not
@@ -281,15 +283,15 @@ pub fn layout_row(chars: &[char], ctx: &Ctx, revealed: bool) -> Vec<VRow> {
     };
     let bar = |slot: usize| {
         let col = p.get(slot).copied().unwrap_or(n);
-        Cell { col, text: glyph(slot).to_string(), width: 1, style: marker(), solid: false }
+        Cell { col, text: glyph(slot).to_string(), width: 1, style: look::of(El::TableBorder), solid: false }
     };
 
     // Each column as lines of cells, every line exactly the column's width.
     let mut columns_lines: Vec<Vec<Vec<Cell>>> = Vec::with_capacity(columns);
     for (k, &w) in ctx.widths.iter().enumerate() {
         let lines = match cs.get(k) {
-            None => vec![vec![pad(n, w, if ruled { "─" } else { " " }, marker())]],
-            Some(cell) if ruled => vec![vec![pad(cell.start, w, "─", marker())]],
+            None => vec![vec![pad(n, w, if ruled { "─" } else { " " }, look::of(El::TableBorder))]],
+            Some(cell) if ruled => vec![vec![pad(cell.start, w, "─", look::of(El::TableBorder))]],
             Some(cell) if revealed => {
                 // Raw source, then virtual padding out to the column edge.
                 // The source brings its own leading space; continuation lines get

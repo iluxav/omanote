@@ -3,6 +3,7 @@
 //! movement can follow wrapped rows.
 
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
 
 use crate::images::Images;
@@ -43,7 +44,11 @@ pub struct View {
     pub rows: Vec<(usize, usize)>,
     /// The "go back" label in the status line, when shown: (row, from, to).
     pub back: Option<(u16, u16, u16)>,
+    /// The fix list's choices, when shown: (x, y, width, rows, index of the first shown).
+    pub fixer: Option<(u16, u16, u16, u16, usize)>,
 }
+
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 pub struct Editor {
     pub lines: Vec<Vec<char>>,
@@ -74,6 +79,10 @@ pub struct Editor {
     pub save_count: u64,
     pub disk_mtime: Option<std::time::SystemTime>,
     pub last_change: Instant,
+    /// Goes up on every change: what the spelling check was last run on.
+    pub edits: u64,
+    /// Tells one editor from another (the spelling check is per note).
+    pub id: u64,
     pub clipboard: String,
     goal_x: Option<u16>,
     follow: bool,
@@ -148,6 +157,8 @@ impl Editor {
             dirty: false,
             save_count: 0,
             last_change: Instant::now(),
+            edits: 0,
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             clipboard: String::new(),
             goal_x: None,
             follow: true,
@@ -562,7 +573,7 @@ impl Editor {
         if w != self.view.w {
             self.goal_x = None;
         }
-        self.view = View { x, y, w, h, rows: Vec::new(), back: None };
+        self.view = View { x, y, w, h, rows: Vec::new(), back: None, fixer: None };
         if self.markdown {
             self.images.prepare(&self.lines, &self.embeds, w, (h * 3 / 5).max(4));
         }
@@ -655,6 +666,7 @@ impl Editor {
         self.count_embeds();
         self.dirty = true;
         self.last_change = Instant::now();
+        self.edits += 1;
         self.goal_x = None;
         self.follow = true;
         self.last_edit = Some((kind, Instant::now(), self.cursor));

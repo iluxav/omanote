@@ -6,7 +6,7 @@
 use ratatui::style::Style;
 use unicode_width::UnicodeWidthStr;
 
-use crate::markdown::{Block, marker, style_line};
+use crate::markdown::{Block, style_line};
 
 pub struct Cell {
     /// Source column this cell was produced from.
@@ -87,7 +87,7 @@ pub fn layout(chars: &[char], block: Block, revealed: bool, width: u16) -> Vec<V
     let prefix_w = sl.prefix.map_or(0, |(t, _)| t.width() as u16);
 
     if sl.rule && !revealed {
-        let cell = Cell { col: 0, text: "─".repeat(width as usize), width, style: marker(), solid: true };
+        let cell = Cell { col: 0, text: "─".repeat(width as usize), width, style: crate::look::of(crate::look::El::Rule), solid: true };
         return vec![VRow { lead: prefix, lead_w: prefix_w, cells: vec![cell], start: 0, end: n, last: true, virt: false }];
     }
 
@@ -147,7 +147,7 @@ pub fn layout(chars: &[char], block: Block, revealed: bool, width: u16) -> Vec<V
             let mut lead_w = prefix_w;
             if i > 0 && hang_w > 0 {
                 if sl.quote && !revealed {
-                    lead.push(("▎".to_string(), Style::new().fg(ratatui::style::Color::Blue)));
+                    lead.push(("▎".to_string(), crate::look::of(crate::look::El::QuoteBar)));
                     lead.push((" ".repeat(hang_w as usize - 1), Style::default()));
                 } else {
                     lead.push((" ".repeat(hang_w as usize), Style::default()));

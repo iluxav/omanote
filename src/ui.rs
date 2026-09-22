@@ -7,6 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 
 use crate::agents::Chooser;
+use crate::commands::{Command, Output, Palette, key_name};
 use crate::config::{Align, Config};
 use crate::editor::{Editor, Pos};
 use crate::find::Find;
@@ -15,6 +16,7 @@ use crate::mention::Mention;
 use crate::pane::Pane;
 use crate::picker::{LineHit, Note, Picker, Row, age};
 use crate::saveas::{After, SaveAs};
+use crate::spell::{Fixer, Problem};
 use crate::theme;
 use crate::vaults::tilde;
 
@@ -137,13 +139,18 @@ pub struct Scene<'a> {
     pub chooser: Option<&'a Chooser>,
     pub mention: Option<&'a Mention>,
     pub find: Option<&'a Find>,
+    /// Ctrl+R: the list of commands that is open.
+    pub palette: Option<(&'a Palette, &'a [Command])>,
+    /// What the spelling check found in the focused note, and the fix list if it is open.
+    pub problems: &'a [Problem],
+    pub fixer: Option<&'a Fixer>,
     pub back: Option<&'a str>,
     /// Where each note is (`vault/folder/`): the focused one's, then the other's.
     pub places: (&'a str, &'a str),
 }
 
 pub fn draw(f: &mut Frame, ed: &mut Editor, scene: Scene) {
-    let Scene { panes, other, on_right, picker, save_as, toast, sync, config, assistant, chooser, mention, find, back, places } = scene;
+    let Scene { panes, other, on_right, picker, save_as, toast, sync, config, assistant, chooser, mention, find, palette, problems, fixer, back, places } = scene;
     if let (Some((pane, focused)), Some(rect)) = (assistant, panes.agent) {
         if let Some(xy) = draw_pane(f, pane, rect, focused) {
             f.set_cursor_position(xy);
@@ -162,22 +169,26 @@ pub fn draw(f: &mut Frame, ed: &mut Editor, scene: Scene) {
     // Even with no room to show it, the other note is there: ^Q closes, F6 changes over.
     let split = other.is_some();
     if let (Some(other), Some(area)) = (other, theirs) {
-        draw_note(f, other, area, config, places.1, None);
+        draw_note(f, other, area, config, places.1, &[], None);
     }
     if let Some(x) = panes.rule {
         let rule: Vec<Line> = (0..panes.left.height).map(|_| Line::styled("│", theme::get().faint())).collect();
         f.render_widget(Paragraph::new(rule), Rect::new(x, panes.left.y, 1, panes.left.height));
     }
     let focus = Focus { toast, sync, back, split, find, cursor: !typing_in_pane };
-    let cursor_xy = draw_note(f, ed, mine, config, places.0, Some(focus));
+    let cursor_xy = draw_note(f, ed, mine, config, places.0, problems, Some(focus));
 
     let area = panes.notes();
     if let Some(chooser) = chooser {
         draw_chooser(f, chooser, area);
+    } else if let Some((palette, commands)) = palette {
+        draw_palette(f, palette, commands, area);
     } else if let Some(prompt) = save_as {
         draw_save_as(f, prompt, toast, area);
     } else if let Some(picker) = picker {
         draw_picker(f, picker, area);
+    } else if let (Some(fixer), Some(xy)) = (fixer, cursor_xy.filter(|_| !typing_in_pane)) {
+        ed.view.fixer = draw_fixer(f, fixer, xy, mine);
     } else if let (Some(mention), Some(xy)) = (mention, cursor_xy.filter(|_| !typing_in_pane)) {
         draw_mention(f, mention, xy, mine);
     }
@@ -194,7 +205,7 @@ struct Focus<'a> {
 }
 
 /// One note in its column: the text, and its footer. Returns where the cursor is.
-fn draw_note(f: &mut Frame, ed: &mut Editor, area: Rect, config: &Config, place: &str, focus: Option<Focus>) -> Option<(u16, u16)> {
+fn draw_note(f: &mut Frame, ed: &mut Editor, area: Rect, config: &Config, place: &str, problems: &[Problem], focus: Option<Focus>) -> Option<(u16, u16)> {
     let (x, _, w, h, table_w) = text_area(area, config)?;
     let right_edge = area.x + area.width;
     ed.table_w = table_w;
@@ -221,7 +232,9 @@ fn draw_note(f: &mut Frame, ed: &mut Editor, area: Rect, config: &Config, place:
                 cursor_xy = Some((cx, 1 + out.len() as u16));
             }
             let marks: Vec<(usize, usize)> = find.map(|f| f.on_row(row).collect()).unwrap_or_default();
-            out.push(render_row(vr, row, ed.lines[row].len(), sel, &marks, find.and_then(|f| f.here(row))));
+            // Only problems whose text is still where it was found: the note may have moved on since the check.
+            let bad: Vec<(usize, usize)> = problems.iter().filter(|p| p.row == row && p.still_there(&ed.lines)).map(|p| (p.from, p.to)).collect();
+            out.push(render_row(vr, row, ed.lines[row].len(), sel, &marks, find.and_then(|f| f.here(row)), &bad));
             map.push((row, vi));
         }
         row += 1;
@@ -388,6 +401,35 @@ fn draw_chooser(f: &mut Frame, c: &Chooser, area: Rect) {
 }
 
 /// One row of a popup's list: marker, text, and a quiet note at the right edge.
+/// Ctrl+R: your commands, with the key each has and what it does with its output.
+fn draw_palette(f: &mut Frame, palette: &Palette, commands: &[Command], area: Rect) {
+    let look = theme::get();
+    let shown = commands.len().clamp(1, PICKER_ROWS).min(area.height.saturating_sub(6) as usize).max(1);
+    let hints = [("↑↓", "select"), ("Enter", "run"), ("1-9", "pick"), ("Esc", "cancel")];
+    let inner = popup(f, area, "Run", "on the selection, or the paragraph", &hints, shown as u16, 62);
+    let first = palette.selected.saturating_sub(shown - 1);
+    let lines: Vec<Line> = commands
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(shown)
+        .map(|(i, command)| {
+            let number = if i < 9 { format!("{}  ", i + 1) } else { "   ".to_string() };
+            let does = match command.output {
+                Output::Replace => "replaces",
+                Output::Insert => "inserts",
+                Output::Message => "shows",
+            };
+            let note = match command.key {
+                Some(key) => format!("{does} · {}", key_name(key)),
+                None => does.to_string(),
+            };
+            list_row(i == palette.selected, vec![Span::styled(number, look.muted()), Span::raw(command.name.clone())], note, inner.width)
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines).style(look.surface()), inner);
+}
+
 fn list_row(selected: bool, mut text: Vec<Span<'static>>, note: String, w: u16) -> Line<'static> {
     let look = theme::get();
     // On a reversed (fallback) selection, dimmed text would vanish: keep it plain.
@@ -513,6 +555,34 @@ fn found_line(note: &Note, hit: &LineHit, w: u16) -> (Vec<Span<'static>>, String
     (spans, place)
 }
 
+/// F7: what is wrong with the word under the cursor, and what to do about it.
+/// Returns where the choices are, for the mouse.
+fn draw_fixer(f: &mut Frame, fixer: &Fixer, cursor: (u16, u16), area: Rect) -> Option<(u16, u16, u16, u16, usize)> {
+    let look = theme::get();
+    let labels = fixer.labels();
+    let rows = labels.len().clamp(1, 8) as u16;
+    // The message, a rule, the choices.
+    let (w, h) = (56u16.min(area.width.saturating_sub(2)), rows + 4);
+    let floor = area.height.saturating_sub(2);
+    if w < 24 || h + 2 > floor {
+        return None;
+    }
+    let y = if cursor.1 + 1 + h <= floor { cursor.1 + 1 } else { cursor.1.saturating_sub(h).max(1) };
+    let x = cursor.0.saturating_sub(4).clamp(area.x, area.x + area.width - w - 1);
+    let hints = [("↑↓", "select"), ("Enter", "apply"), ("F7", "next"), ("Esc", "close")];
+    frame(f, area, Rect::new(x, y, w, h), if fixer.problem.spelling { "Spelling" } else { "Grammar" }, "", &hints);
+    let inner = (w - 4) as usize;
+    let message: String = fixer.problem.message.chars().take(inner).collect();
+    let mut lines = vec![Line::styled(format!(" {message}"), look.muted()), Line::styled("─".repeat(inner + 2), look.faint())];
+    let first = fixer.selected.saturating_sub(rows as usize - 1);
+    for (i, label) in labels.iter().enumerate().skip(first).take(rows as usize) {
+        let number = if i < 9 { format!("{}  ", i + 1) } else { "   ".to_string() };
+        lines.push(list_row(i == fixer.selected, vec![Span::styled(number, look.muted()), Span::raw(label.clone())], String::new(), w - 2));
+    }
+    f.render_widget(Paragraph::new(lines).style(look.surface()), Rect::new(x + 1, y + 1, w - 2, rows + 2));
+    Some((x + 1, y + 3, w - 2, rows, first))
+}
+
 /// The `@` suggestions: a short list hanging from the cursor. The note keeps
 /// the keyboard, so nothing is dimmed and the cursor stays where it is.
 fn draw_mention(f: &mut Frame, m: &Mention, cursor: (u16, u16), area: Rect) {
@@ -598,12 +668,15 @@ fn draw_picker(f: &mut Frame, p: &Picker, area: Rect) {
 
 /// `marks`: what the find bar matched on this line, in yellow; `here`: the
 /// match the search is on, in light green so it stands out from the rest.
-fn render_row(vr: &VRow, row: usize, line_len: usize, sel: Option<(Pos, Pos)>, marks: &[(usize, usize)], here: Option<(usize, usize)>) -> Line<'static> {
+#[allow(clippy::too_many_arguments)]
+fn render_row(vr: &VRow, row: usize, line_len: usize, sel: Option<(Pos, Pos)>, marks: &[(usize, usize)], here: Option<(usize, usize)>, bad: &[(usize, usize)]) -> Line<'static> {
     let selected = |col: usize| sel.is_some_and(|(s, e)| s <= Pos { row, col } && Pos { row, col } < e);
     let marked = |col: usize| marks.iter().any(|&(from, to)| (from..to).contains(&col));
     let current = |col: usize| here.is_some_and(|(from, to)| (from..to).contains(&col));
     let lit = Style::new().fg(Color::Black).bg(Color::Yellow);
     let lit_here = Style::new().fg(Color::Black).bg(Color::LightGreen);
+    let misspelt = |col: usize| bad.iter().any(|&(from, to)| (from..to).contains(&col));
+    let underline = crate::look::of(crate::look::El::Spelling);
     let mut spans: Vec<Span> = vr.lead.iter().map(|(t, s)| Span::styled(t.clone(), *s)).collect();
     let mut run = String::new();
     let mut run_style = Style::default();
@@ -614,6 +687,8 @@ fn render_row(vr: &VRow, row: usize, line_len: usize, sel: Option<(Pos, Pos)>, m
             cell.style.add_modifier(Modifier::REVERSED)
         } else if cell.solid && marked(cell.col) {
             cell.style.patch(lit)
+        } else if cell.solid && misspelt(cell.col) {
+            cell.style.patch(underline)
         } else {
             cell.style
         };

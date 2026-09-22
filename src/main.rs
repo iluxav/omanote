@@ -1,13 +1,16 @@
 mod agents;
 mod capture;
 mod clipboard;
+mod commands;
 mod config;
 mod desktop;
 mod diacritics;
 mod editor;
 mod find;
+mod grammar;
 mod images;
 mod layout;
+mod look;
 mod markdown;
 mod mention;
 mod now;
@@ -15,6 +18,7 @@ mod pane;
 mod picker;
 mod remind;
 mod saveas;
+mod spell;
 mod sync;
 mod table;
 mod theme;
@@ -50,6 +54,8 @@ use saveas::{After, SaveAs};
 const DEMO: &str = include_str!("../demo.md");
 const AUTOSAVE_IDLE: Duration = Duration::from_millis(1500);
 const TOAST: Duration = Duration::from_secs(2);
+/// How long the typing has to pause before the spelling is checked.
+const SPELL_SETTLE: Duration = Duration::from_millis(400);
 const DOUBLE_CLICK: Duration = Duration::from_millis(350);
 /// How long `omanote <name>` waits for GitHub before giving up and starting a new note.
 const PULL_PATIENCE: Duration = Duration::from_secs(8);
@@ -77,6 +83,28 @@ struct App {
     save_as: Option<SaveAs>,
     /// The note suggestions open under an `@` being typed.
     mention: Option<Mention>,
+    /// Ctrl+R: the list of your own commands, and the one that is running.
+    palette: Option<commands::Palette>,
+    running: Option<commands::Running>,
+    /// Spelling: the checker on its thread, what it found in the note on
+    /// screen (and which edit that answers), and the F7 fix list.
+    spell: Option<spell::Checker>,
+    /// The grammar model's checker, when its file is there, and what each checker last found.
+    grammar: Option<grammar::Checker>,
+    spelling_found: Vec<spell::Problem>,
+    grammar_found: Vec<spell::Problem>,
+    grammar_asked: u64,
+    problems: Vec<spell::Problem>,
+    spell_note: u64,
+    spell_asked: u64,
+    spell_answered: u64,
+    ignored: std::collections::HashSet<String>,
+    fixer: Option<spell::Fixer>,
+    /// Shift+F7 switches the checking on and off; remembered between sessions.
+    /// Off until it is asked for: the grammar model is downloaded then.
+    checking: bool,
+    downloading: Option<grammar::Download>,
+    spell_dialect: Option<harper_core::Dialect>,
     /// Ctrl+F: the find bar, and what was searched for last (for F3).
     find: Option<find::Find>,
     last_find: String,
@@ -137,7 +165,9 @@ impl App {
         let (settings, problems) = config::load(&vaults::home());
         match (problems.first(), explicit) {
             (None, _) => {
+                look::apply(&settings.look);
                 self.settings = settings;
+                self.spell_setup();
                 self.repaint = true;
                 if explicit {
                     self.say("Settings applied");
@@ -775,14 +805,374 @@ impl App {
         if self.picker.is_some() {
             return self.picker_key(key);
         }
+        if self.palette.is_some() {
+            return self.palette_key(key);
+        }
+        if self.fixer.is_some() {
+            return self.fixer_key(key);
+        }
         if self.find.is_some() {
             return self.find_key(key);
+        }
+        // Esc stops a command that is running; a key of yours starts one.
+        if key.code == KeyCode::Esc && self.running.is_some() && self.mention.is_none() {
+            if let Some(running) = &self.running {
+                running.cancel();
+            }
+            return;
+        }
+        if let Some(at) = commands::bound(&self.settings.commands, &key) {
+            return self.run_command(at);
         }
         if self.mention_key(key) {
             return;
         }
         self.editor_key(key);
         self.mention_after(key);
+    }
+
+    // ---- spelling ----------------------------------------------------------
+
+    /// Start, stop or restart the checker to match the settings.
+    fn spell_setup(&mut self) {
+        let wanted = (self.settings.spelling && self.checking).then(|| spell::dialect(&self.settings.dialect)).flatten();
+        match (wanted, &self.spell) {
+            (None, None) => {}
+            (None, Some(_)) => {
+                self.spell = None;
+                self.grammar = None;
+                self.problems.clear();
+                self.fixer = None;
+            }
+            (Some(dialect), current) => {
+                if current.is_none() || self.spell_dialect != Some(dialect) {
+                    self.spell = Some(spell::Checker::start(&vaults::home(), dialect));
+                    self.spell_dialect = Some(dialect);
+                    self.spell_asked = u64::MAX;
+                }
+                // The grammar model, if its file is there. It is English whatever the dialect.
+                let model = grammar::model_path();
+                if self.grammar.is_none() && model.exists() {
+                    self.grammar = Some(grammar::Checker::start(model));
+                    self.grammar_asked = u64::MAX;
+                }
+            }
+        }
+    }
+
+    /// Ask for a check once the typing has paused, and take in what came
+    /// back. True when the screen should change.
+    fn spell_tick(&mut self) -> bool {
+        let Some(checker) = &self.spell else { return false };
+        if self.spell_note != self.ed.id {
+            self.spell_note = self.ed.id;
+            self.spell_asked = u64::MAX;
+            self.grammar_asked = u64::MAX;
+            self.problems.clear();
+            self.spelling_found.clear();
+            self.grammar_found.clear();
+            self.fixer = None;
+        }
+        if !self.ed.markdown {
+            return !std::mem::take(&mut self.problems).is_empty();
+        }
+        if self.spell_asked != self.ed.edits && self.ed.last_change.elapsed() >= SPELL_SETTLE {
+            self.spell_asked = self.ed.edits;
+            let text: Vec<String> = self.ed.lines.iter().map(|l| l.iter().collect()).collect();
+            checker.check(self.spell_asked, text.join("\n"));
+        }
+        let mut changed = false;
+        while let Some((n, found)) = checker.results() {
+            if n == self.spell_asked {
+                self.spelling_found = found;
+                self.spell_answered = n;
+                changed = true;
+            }
+        }
+        if let Some(model) = &self.grammar {
+            if self.grammar_asked != self.ed.edits && self.ed.last_change.elapsed() >= SPELL_SETTLE {
+                self.grammar_asked = self.ed.edits;
+                // Prose only: headings, lists, quotes and paragraphs; not code, tables or long pasted lines.
+                let lines: Vec<(usize, String)> = self
+                    .ed
+                    .lines
+                    .iter()
+                    .enumerate()
+                    .filter(|(row, line)| matches!(self.ed.blocks.get(*row), Some(markdown::Block::Normal)) && !line.is_empty() && line.len() < 600)
+                    .map(|(row, line)| (row, line.iter().collect()))
+                    .collect();
+                model.check(self.grammar_asked, lines);
+            }
+            let mut broken = None;
+            while let Some(news) = model.news() {
+                match news {
+                    grammar::News::Found(n, found) if n == self.grammar_asked => {
+                        self.grammar_found = found;
+                        changed = true;
+                    }
+                    grammar::News::Unavailable(why) => broken = Some(why),
+                    _ => {}
+                }
+            }
+            if let Some(why) = broken {
+                self.grammar = None;
+                self.say(format!("Grammar checking is off: {why}"));
+            }
+        }
+        if changed {
+            self.merge_problems();
+        }
+        changed
+    }
+
+    /// One list from both checkers, in reading order. Where both mark the same
+    /// words, one mark, with the grammar model's fix first: it has read the sentence.
+    fn merge_problems(&mut self) {
+        let mut all: Vec<spell::Problem> = self.grammar_found.clone();
+        for p in &self.spelling_found {
+            match all.iter_mut().find(|g| g.row == p.row && g.from < p.to && p.from < g.to) {
+                Some(g) if g.from == p.from && g.to == p.to => {
+                    for fix in &p.fixes {
+                        if !g.fixes.contains(fix) {
+                            g.fixes.push(fix.clone());
+                        }
+                    }
+                    g.spelling |= p.spelling;
+                }
+                Some(_) => {}
+                None => all.push(p.clone()),
+            }
+        }
+        all.retain(|p| !self.ignored.contains(&p.word.to_lowercase()));
+        all.sort_by_key(|p| (p.row, p.from));
+        self.problems = all;
+    }
+
+    fn problem_at_cursor(&self) -> Option<&spell::Problem> {
+        self.problems.iter().find(|p| p.has(self.ed.cursor) && p.still_there(&self.ed.lines))
+    }
+
+    /// F7: the fix list for the problem under the cursor, or the next one along.
+    fn next_problem(&mut self) {
+        if self.spell.is_none() {
+            return self.say(if self.checking { "Spelling is off · spelling = true in the settings (omanote --config) turns it on" } else { "Checking is off · Shift+F7 turns it on" });
+        }
+        if !self.ed.markdown {
+            return self.say("Only markdown notes are checked");
+        }
+        let lines = &self.ed.lines;
+        self.problems.retain(|p| p.still_there(lines));
+        let was_open = self.fixer.take().is_some();
+        if self.problems.is_empty() {
+            return self.say(if self.spell_answered == self.ed.edits { "No spelling or grammar problems found" } else { "Still checking…" });
+        }
+        let cursor = self.ed.cursor;
+        let here = self.problems.iter().position(|p| p.has(cursor));
+        let at = match here {
+            Some(i) if !was_open => i,
+            Some(i) => (i + 1) % self.problems.len(),
+            None => self.problems.iter().position(|p| (p.row, p.from) > (cursor.row, cursor.col)).unwrap_or(0),
+        };
+        let problem = self.problems[at].clone();
+        self.ed.move_to(Pos { row: problem.row, col: problem.from }, false);
+        self.mention = None;
+        self.fixer = Some(spell::Fixer { problem, selected: 0 });
+    }
+
+    /// Shift+F7: spelling and grammar on, or off with their memory freed. The
+    /// first time on, the grammar model is fetched first.
+    fn toggle_checking(&mut self) {
+        if let Some(download) = self.downloading.take() {
+            download.cancel();
+            return self.say("Download stopped · Shift+F7 starts it again");
+        }
+        if self.checking {
+            self.set_checking(false);
+            return self.say("Spelling and grammar off · Shift+F7 turns them back on");
+        }
+        if !grammar::model_path().exists() {
+            self.downloading = Some(grammar::Download::start(grammar::model_path()));
+            return;
+        }
+        self.set_checking(true);
+        self.say(if self.settings.spelling { "Spelling and grammar on · Shift+F7 turns them off" } else { "Checking is on, but spelling = false in the settings keeps it off" });
+    }
+
+    fn set_checking(&mut self, on: bool) {
+        self.checking = on;
+        let file = checking_on_file();
+        let _ = if on { std::fs::write(&file, "") } else { std::fs::remove_file(&file) };
+        if on {
+            self.spell_setup();
+        } else {
+            self.spell = None;
+            self.grammar = None;
+            self.spell_dialect = None;
+            self.problems.clear();
+            self.spelling_found.clear();
+            self.grammar_found.clear();
+            self.fixer = None;
+        }
+    }
+
+    /// The model arrived (or did not): checking goes on, as was asked.
+    fn poll_download(&mut self) -> bool {
+        let Some(result) = self.downloading.as_ref().and_then(|d| d.finished()) else { return false };
+        self.downloading = None;
+        match result {
+            Ok(()) => {
+                self.set_checking(true);
+                self.say(format!("Grammar model downloaded ({} MB) · spelling and grammar on", grammar::MODEL_BYTES / 1_000_000));
+            }
+            Err(why) if why == "cancelled" => {}
+            Err(why) => self.say(format!("Could not download the grammar model: {why} · Shift+F7 tries again")),
+        }
+        true
+    }
+
+    /// The fix list for the problem under the cursor, if there is one.
+    fn open_fixer_here(&mut self) {
+        if let Some(problem) = self.problem_at_cursor().cloned() {
+            self.mention = None;
+            self.fixer = Some(spell::Fixer { problem, selected: 0 });
+        }
+    }
+
+    fn fixer_key(&mut self, key: KeyEvent) {
+        let Some(fixer) = &mut self.fixer else { return };
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => self.fixer = None,
+            KeyCode::Char('c') if ctrl => self.fixer = None,
+            KeyCode::F(7) if key.modifiers.contains(KeyModifiers::SHIFT) => self.toggle_checking(),
+            KeyCode::F(19) => self.toggle_checking(),
+            KeyCode::F(7) | KeyCode::Right => self.next_problem(),
+            KeyCode::Up | KeyCode::BackTab => fixer.step(-1),
+            KeyCode::Down | KeyCode::Tab => fixer.step(1),
+            KeyCode::Char(c @ '1'..='9') if (c as usize - '1' as usize) < fixer.choices().len() => {
+                fixer.selected = c as usize - '1' as usize;
+                self.apply_fix();
+            }
+            KeyCode::Enter => self.apply_fix(),
+            // Anything else is typing: the list goes, the key reaches the note.
+            _ => {
+                self.fixer = None;
+                self.editor_key(key);
+                self.mention_after(key);
+            }
+        }
+    }
+
+    fn apply_fix(&mut self) {
+        let Some(fixer) = self.fixer.take() else { return };
+        if !fixer.problem.still_there(&self.ed.lines) {
+            return self.say("That text has changed since it was checked");
+        }
+        let problem = fixer.problem.clone();
+        let word = problem.word.clone();
+        let choices = fixer.choices();
+        match choices.get(fixer.selected) {
+            Some(spell::Choice::Fix(fix)) => {
+                match fix {
+                    spell::Fix::Replace(with) => self.ed.replace_on_line(problem.from, problem.to, with),
+                    spell::Fix::InsertAfter(with) => {
+                        self.ed.move_to(Pos { row: problem.row, col: problem.to }, false);
+                        self.ed.insert_str(with);
+                    }
+                    spell::Fix::Remove => self.ed.replace_on_line(problem.from, problem.to, ""),
+                }
+                self.problems.retain(|p| *p != problem);
+                self.grammar_found.retain(|p| *p != problem);
+                self.spelling_found.retain(|p| !(p.row == problem.row && p.from == problem.from));
+                self.say("Fixed · F7 goes to the next one, Ctrl+Z undoes");
+            }
+            Some(spell::Choice::Learn) => {
+                if let Some(checker) = &self.spell {
+                    checker.learn(&word);
+                    self.say(format!("“{word}” added to your dictionary ({})", vaults::tilde(&checker.dictionary_file())));
+                }
+                self.ignored.insert(word.to_lowercase());
+                self.problems.retain(|p| p.word.to_lowercase() != word.to_lowercase());
+            }
+            Some(spell::Choice::Ignore) => {
+                self.ignored.insert(word.to_lowercase());
+                self.problems.retain(|p| p.word.to_lowercase() != word.to_lowercase());
+                self.say(format!("“{word}” ignored until omanote is next started"));
+            }
+            None => {}
+        }
+    }
+
+    /// Ctrl+R: your own commands.
+    fn open_palette(&mut self) {
+        if self.settings.commands.is_empty() {
+            return self.say("No commands yet. Add yours in the settings (omanote --config): command.Sort lines = \"sort\"");
+        }
+        self.mention = None;
+        self.palette = Some(commands::Palette { selected: 0 });
+    }
+
+    fn palette_key(&mut self, key: KeyEvent) {
+        let Some(palette) = &mut self.palette else { return };
+        let n = self.settings.commands.len().max(1);
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => self.palette = None,
+            KeyCode::Char('c' | 'r') if ctrl => self.palette = None,
+            KeyCode::Up | KeyCode::BackTab => palette.selected = (palette.selected + n - 1) % n,
+            KeyCode::Down | KeyCode::Tab => palette.selected = (palette.selected + 1) % n,
+            KeyCode::Char(c @ '1'..='9') if (c as usize - '1' as usize) < n => {
+                self.palette = None;
+                self.run_command(c as usize - '1' as usize);
+            }
+            KeyCode::Enter => {
+                let at = palette.selected;
+                self.palette = None;
+                self.run_command(at);
+            }
+            _ => {}
+        }
+    }
+
+    /// Start one of your commands. It runs beside the editor, which stays
+    /// usable; `poll_command` puts the result in when it is done.
+    fn run_command(&mut self, at: usize) {
+        let Some(command) = self.settings.commands.get(at).cloned() else { return };
+        if let Some(running) = &self.running {
+            return self.say(format!("{} is still running · Esc stops it", running.name));
+        }
+        // {file} should be what is on screen.
+        if self.ed.dirty && self.ed.path.is_some() {
+            if let Err(e) = self.ed.save() {
+                return self.say(format!("Could not save: {e}"));
+            }
+        }
+        // In the note's vault, as the assistant is; a loose file's own folder.
+        let all = vaults::all(&vaults::home());
+        let note = self.ed.path.as_ref().map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()));
+        let vault = note.as_ref().and_then(|n| all.iter().map(|v| &v.path).filter(|v| n.starts_with(v)).max_by_key(|v| v.as_os_str().len()).cloned());
+        let dir = vault.or_else(|| note.as_ref().and_then(|n| n.parent().map(PathBuf::from))).or_else(|| all.first().map(|v| v.path.clone())).unwrap_or_else(|| PathBuf::from("."));
+        match commands::start(&command, &self.ed, &dir) {
+            Ok(running) => {
+                self.mention = None;
+                self.running = Some(running);
+            }
+            Err(e) => self.say(e),
+        }
+    }
+
+    /// Whether a running command is done; true if something changed on screen.
+    fn poll_command(&mut self) -> bool {
+        let Some(running) = &self.running else { return false };
+        let mut spare = None;
+        let commands::Outcome::Said(said) = running.finish(&mut self.ed, &mut spare) else { return false };
+        self.running = None;
+        if let Some(text) = spare {
+            clipboard::copy(&text);
+            self.ed.clipboard = text;
+        }
+        self.say(said);
+        true
     }
 
     /// Ctrl+F, or F3 to carry on with the last search.
@@ -981,6 +1371,7 @@ impl App {
         match key.code {
             KeyCode::Char(c) if ctrl => match c.to_ascii_lowercase() {
                 'q' => self.quit(),
+                'r' => self.open_palette(),
                 'f' => self.open_find(0),
                 'o' => self.follow(self.ed.cursor, shift),
                 'p' => {
@@ -1059,6 +1450,10 @@ impl App {
             KeyCode::F(2) => self.relocate(),
             KeyCode::F(3) => self.open_find(if shift { -1 } else { 1 }),
             KeyCode::F(6) => self.swap_focus(),
+            // Shift+F7 arrives as F19 from terminals that do not report Shift with F keys.
+            KeyCode::F(7) if shift => self.toggle_checking(),
+            KeyCode::F(19) => self.toggle_checking(),
+            KeyCode::F(7) => self.next_problem(),
             KeyCode::Esc => ed.clear_selection(),
             _ => {}
         }
@@ -1117,6 +1512,15 @@ impl App {
     }
 
     fn mouse(&mut self, m: MouseEvent) {
+        // `--keys`: what the terminal says the mouse did, and where in the note
+        // that lands. Bare movement is left out: it would drown the rest.
+        if let Some(log) = self.key_log.as_mut().filter(|_| !matches!(m.kind, MouseEventKind::Moved)) {
+            use std::io::Write;
+            let (pos, _) = self.ed.pos_at(m.column, m.row);
+            let line = format!("mouse {:?} {:?} at column {} row {} -> line {} col {}", m.kind, m.modifiers, m.column, m.row, pos.row + 1, pos.col + 1);
+            let _ = writeln!(log, "{line}");
+            self.toast = Some((line, Instant::now()));
+        }
         // A click picks the side. Inside the pane the mouse is ours, not the
         // assistant's: drag selects (copied on release), the wheel scrolls back.
         if self.pane.is_some() && self.save_as.is_none() && self.picker.is_none() {
@@ -1164,8 +1568,22 @@ impl App {
             }
             return;
         }
+        // A click on one of the fixes applies it.
+        if let (Some(_), MouseEventKind::Down(MouseButton::Left), Some((x, y, w, rows, first))) = (&self.fixer, m.kind, self.ed.view.fixer) {
+            if (x..x + w).contains(&m.column) && (y..y + rows).contains(&m.row) {
+                let at = first + (m.row - y) as usize;
+                if let Some(fixer) = &mut self.fixer {
+                    if at < fixer.choices().len() {
+                        fixer.selected = at;
+                    }
+                }
+                return self.apply_fix();
+            }
+        }
         if matches!(m.kind, MouseEventKind::Down(_)) {
             self.close_find();
+            self.palette = None;
+            self.fixer = None;
         }
         // Over the other note: the wheel scrolls it where it is, a click moves in.
         if self.other_area.is_some_and(|r| (r.x..r.x + r.width).contains(&m.column)) {
@@ -1220,6 +1638,8 @@ impl App {
                     ed.move_to(pos, true);
                 }
             }
+            // A plain click (not a drag, not a double click) on an underlined word: its fixes.
+            MouseEventKind::Up(MouseButton::Left) if ed.selection().is_none() && self.last_click.is_some_and(|(_, at)| at == ed.cursor) => self.open_fixer_here(),
             _ => {}
         }
     }
@@ -1301,6 +1721,16 @@ mod tests {
         // A real file wins even without an extension (run from the project root).
         assert_eq!(t(&["Makefile"]), Target::File("Makefile".into()));
     }
+    /// macOS runs /bin/sh as bash 3.2, which reads the bytes of a character
+    /// such as an ellipsis as part of a variable's name: `"from $REPO…"` asked
+    /// for a variable that does not exist and the install died under `set -u`.
+    /// Nothing on Linux notices, so this does.
+    #[test]
+    fn the_install_script_is_plain_ascii() {
+        let script = include_str!("../install.sh");
+        let odd: Vec<&str> = script.lines().filter(|l| !l.is_ascii()).collect();
+        assert!(odd.is_empty(), "not ASCII: {odd:?}");
+    }
 }
 
 const HELP: &str = "\
@@ -1321,6 +1751,14 @@ omanote — a small markdown note editor
   Ctrl+F inside the editor    find in the note: matches light up as you type, Enter or
                               the arrows move between them, Esc leaves you on the match.
                               F3 / Shift+F3 search again for the same thing
+  F7 inside the editor        spelling and grammar: mistakes are underlined as you write;
+                              F7 (or a click on the word) lists the fixes, Enter applies,
+                              or adds the word to ~/.omanote/dictionary.txt. Checking is
+                              off until Shift+F7 turns it on (the first time, it downloads
+                              the 78 MB grammar model); Shift+F7 again turns it off
+  Ctrl+R inside the editor    your own commands: command.<name> = \"<anything a shell runs>\"
+                              in the settings. The selection (or the paragraph) goes in,
+                              what comes out takes its place: grammar, translation, dates
   @ inside the editor         link a note: type @ and a few letters, pick from the list
                               (the last entry creates a note by that name), Enter
   Ctrl+K                      make the selected text a link: [text](), with the cursor
@@ -1368,7 +1806,7 @@ Desktop:
                               saving applies them straight away
   Ctrl+L inside the editor    repaint the screen
 
-  --keys                      show every key event (for diagnosing a terminal)
+  --keys                      show and log every key and mouse event (for diagnosing a terminal)
   -h, --help                  this text
 ";
 
@@ -1491,6 +1929,11 @@ fn cli(args: &[String]) -> Result<(Target, bool, bool, Option<String>, Land), St
     Ok((target(&words), keys, demo, agent, line.map(|l| (l, word))))
 }
 
+/// Present while checking is switched on with Shift+F7.
+fn checking_on_file() -> PathBuf {
+    vaults::home().join("checking-on")
+}
+
 /// A note made from an `@` mention: just its title, ready to be written in.
 /// An existing file is left alone.
 fn start_note(path: &std::path::Path) -> std::io::Result<()> {
@@ -1515,7 +1958,14 @@ fn main() -> std::io::Result<()> {
         std::process::exit(2);
     });
     let key_log = match keys {
-        true => Some(std::fs::File::create(std::env::temp_dir().join("omanote-keys.log"))?),
+        true => {
+            // Which terminal this is goes first: the log is only useful knowing that.
+            let mut log = std::fs::File::create(std::env::temp_dir().join("omanote-keys.log"))?;
+            let var = |name: &str| std::env::var(name).unwrap_or_default();
+            let size = ratatui::crossterm::terminal::size().unwrap_or_default();
+            writeln!(log, "omanote {} on {} · TERM={} TERM_PROGRAM={} {} · LC_TERMINAL={} · {}x{} cells", env!("CARGO_PKG_VERSION"), std::env::consts::OS, var("TERM"), var("TERM_PROGRAM"), var("TERM_PROGRAM_VERSION"), var("LC_TERMINAL"), size.0, size.1)?;
+            Some(log)
+        }
         false => None,
     };
     // A name is looked up before the screen is taken over: one match is simply
@@ -1611,6 +2061,22 @@ fn main() -> std::io::Result<()> {
         toast: None,
         last_click: None,
         mention: None,
+        palette: None,
+        running: None,
+        spell: None,
+        grammar: None,
+        spelling_found: Vec::new(),
+        grammar_found: Vec::new(),
+        grammar_asked: u64::MAX,
+        problems: Vec::new(),
+        spell_note: 0,
+        spell_asked: u64::MAX,
+        spell_answered: u64::MAX,
+        ignored: std::collections::HashSet::new(),
+        fixer: None,
+        checking: checking_on_file().exists(),
+        downloading: None,
+        spell_dialect: None,
         find: None,
         last_find: String::new(),
         now: None,
@@ -1640,7 +2106,9 @@ fn main() -> std::io::Result<()> {
 
     let all_vaults = vaults::all(&vaults::home());
     let (settings, problems) = config::load(&vaults::home());
+    look::apply(&settings.look);
     app.settings = settings;
+    app.spell_setup();
     if let Some(first) = problems.first() {
         app.say(format!("config.toml, {first}"));
     }
@@ -1658,6 +2126,12 @@ fn main() -> std::io::Result<()> {
         let mut drawn = Instant::now();
         while !app.quit && !STOP.load(Ordering::Relaxed) {
             app.reap_pane();
+            if app.poll_command() {
+                redraw = true;
+            }
+            if app.spell_tick() || app.poll_download() {
+                redraw = true;
+            }
             // The assistant prints whenever it likes, so with the pane open we
             // look often, but only draw when something actually changed.
             let printed = app.pane.as_ref().is_some_and(|p| p.take_dirty());
@@ -1669,7 +2143,16 @@ fn main() -> std::io::Result<()> {
                 }
                 app.tick();
                 app.tell_agent();
-                let toast = app.toast.as_ref().map(|(msg, _)| msg.clone());
+                let toast = match (&app.running, &app.downloading) {
+                    (Some(running), _) => Some(format!("Running {}… {}s · Esc stops it", running.name, running.seconds())),
+                    (None, Some(d)) => {
+                        let mb = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000;
+                        Some(format!("Downloading the grammar model… {} of {} MB · Shift+F7 stops it", mb(&d.got), mb(&d.total)))
+                    }
+                    (None, None) => app.toast.as_ref().map(|(msg, _)| msg.clone()),
+                };
+                // On a misspelling, with nothing else to say: what is wrong with it.
+                let toast = toast.or_else(|| app.fixer.is_none().then(|| app.problem_at_cursor().map(|p| format!("{} · F7", p.message))).flatten());
                 let syncing = app.ed.path.as_ref().and_then(|p| app.sync.state(p, &all_vaults));
                 let size = terminal.size()?;
                 if std::mem::take(&mut app.repaint) {
@@ -1721,13 +2204,16 @@ fn main() -> std::io::Result<()> {
                     chooser: app.chooser.as_ref(),
                     mention: app.mention.as_ref(),
                     find: app.find.as_ref(),
+                    palette: app.palette.as_ref().map(|p| (p, app.settings.commands.as_slice())),
+                    problems: &app.problems,
+                    fixer: app.fixer.as_ref(),
                     back: back.as_deref(),
                     places: (&places.0, &places.1),
                 };
                 terminal.draw(|f| ui::draw(f, &mut app.ed, scene))?;
             }
 
-            let wait = Duration::from_millis(if app.pane.is_some() { 25 } else { 250 });
+            let wait = Duration::from_millis(if app.pane.is_some() { 25 } else if app.running.is_some() { 80 } else { 250 });
             let input = match watch_terminal(wait) {
                 Tty::Gone => {
                     STOP.store(true, Ordering::Relaxed);
@@ -1763,6 +2249,9 @@ fn main() -> std::io::Result<()> {
         app.leave();
     }
     restore_terminal(enhanced_keys);
+    if keys {
+        println!("What the terminal sent is in {}", std::env::temp_dir().join("omanote-keys.log").display());
+    }
     result
 }
 

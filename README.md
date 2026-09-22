@@ -56,6 +56,8 @@ Write first, name it later: on a new note `Ctrl+S` asks where to keep it (a vaul
 | `Ctrl+P` | find a note by fuzzy search, or create one |
 | `Ctrl+S` / `Ctrl+Q` | save / quit |
 | `Ctrl+F`, `F3` | find in the note, find the next one |
+| `F7` / `Shift+F7` | next spelling or grammar problem, with its fixes / checking off and on |
+| `Ctrl+R` | run one of your own commands on the selection |
 | `F2` | move, rename or copy the note: another vault, another folder, another name |
 | `@` | link another note: suggestions as you type, or create one |
 | `Ctrl+K` | make the selected text a link |
@@ -134,6 +136,52 @@ assistant      = "codex"          # always this one: a name, or a full command
 
 `{context}` is the description above, `{file}` the note and `{dir}` the folder the agent starts in; `{now}` is the file that follows you between notes and `{nowdir}` its folder. The pane is a small terminal emulator: colours, full-screen programs and paste work. The mouse belongs to omanote (select, scroll), so the agent itself never sees it, and terminal-specific extras are not passed through.
 
+### Spelling and grammar
+
+Mistakes are underlined as you write, and nothing leaves your machine: the checker ([Harper](https://writewithharper.com)) is built into omanote, so there is nothing to install or sign in to. It knows English in its American, British, Canadian, Australian and Indian spellings, catches misspelt words, doubled words (`of of`), `an test`, `we has` and the like, and leaves code, links' addresses and markdown itself alone.
+
+`Shift+F7` switches all of this off, and back on; omanote remembers which, and while it is off nothing is checked or held in memory.
+
+Put the cursor on an underlined word and the status line says what is wrong. `F7` opens the list of fixes under it (`Enter` or its number applies one, `Ctrl+Z` undoes), and `F7` again goes to the next problem. The list also offers to add the word to your dictionary, `~/.omanote/dictionary.txt`, a plain list of words you can edit, or to ignore it until omanote is next started. Rules that are taste rather than error (title case in headings, capital letters at the start of every line) are off, so notes and lists do not light up.
+
+```toml
+spelling = false                  # turn it off
+spelling.dialect = "british"      # american (the default), british, canadian, australian, indian
+editor.style.spelling.color = "yellow"   # the underline's colour
+```
+
+It checks the note you are writing in, a moment after you pause; plain-text files are left alone. It cannot know that "tree nights" should be "three": for wrong-but-real words and for rephrasing, a command that hands the paragraph to an AI (below) is the tool.
+
+### Your own commands
+
+omanote is extended with commands, not plugins: anything a shell can run, written in whatever you like. Define them in the settings (`omanote --config`):
+
+```toml
+command.Rewrite = "llm 'Rewrite this more clearly. Reply with the text only.'"
+command.Rewrite.key = "F5"
+
+command.Insert date = "date +%F"
+command.Insert date.output = "insert"
+command.Insert date.key = "alt+d"
+
+command.Word count = "wc -w < {file}"
+command.Word count.output = "message"
+```
+
+`Ctrl+R` lists them (arrows and `Enter`, or the number); a command with a `key` also runs straight from it. `llm` above stands for whichever AI CLI you have (`llm`, `claude -p`, `codex exec`, `ollama run …`): anything that reads text on its standard input and prints text works, and none is assumed. The selected text goes to the command's standard input, and with nothing selected it is the paragraph your cursor is in. What happens to what it prints is its `output`:
+
+| | |
+| --- | --- |
+| `replace` (the default) | it takes the place of the text that went in. One `Ctrl+Z` brings the old text back |
+| `insert` | it is written at the cursor (after the selection, if there is one) |
+| `message` | nothing in the note changes; the first line is shown in the status line |
+
+In the command, `{file}` is the note, `{dir}` its folder, `{name}` its name without `.md` and `{line}` the cursor's line (also `$OMANOTE_FILE`, `$OMANOTE_DIR`, `$OMANOTE_NAME`, `$OMANOTE_LINE`, `$OMANOTE_SELECTION`). They are passed as quoted variables, so a file name with spaces or quotes in it cannot break the command. The note is saved first, and the command runs in the note's vault, through your login shell, so it finds the same programs your terminal does. A key is `F1`–`F12` or a letter with `alt` (`alt+g`); the editor's own keys cannot be taken.
+
+A command runs beside the editor, which stays usable: the status line shows `Running Rewrite… 4s`, and `Esc` stops it, along with anything it started. Your text is never overwritten behind your back: if the text a command was given has changed by the time it answers, the note is left alone and the result goes to the clipboard instead. A command that fails, or prints nothing, changes nothing and says why (the first line of its error output). Commands are stopped after three minutes.
+
+Anything that reads text and prints text fits: `llm`, `claude -p`, `codex exec`, `pandoc`, `sort`, `fmt`, `jq`, a translation script, your own Python. For example `command.Sort lines = "sort"`, `command.To English = "llm 'Translate to English. Reply with the translation only.'"`, `command.Publish = "pandoc {file} -o ~/site/{name}.html"` with `output = "message"`.
+
 ### Tables
 
 Type a header row such as `| Item | Price |` and press `Enter`; the rest of the table is created for you.
@@ -208,6 +256,27 @@ width = 84          # widest the text column gets; 0 = the whole window
 align = "center"    # where the column sits in a wide window: "left", "center", "right"
 margin = 2          # blank columns kept at the window's edges
 ```
+
+#### How the text looks
+
+Every element of a note has a style you can change, as `editor.style.<element>.<property>`:
+
+```toml
+editor.style.h1.color = "#ff9e64"
+editor.style.h1.underline = false
+editor.style.text.color = "#c0caf5"
+editor.style.code.background = "#1f2335"
+editor.style.link.color = "cyan"
+editor.style.task.done.text.strike = false
+```
+
+| | |
+| --- | --- |
+| elements | `text` `h1`–`h6` `bold` `italic` `strike` `highlight` `code` `codeblock` `link` `tag` `quote` `quote.bar` `list` `task` `task.done` `task.done.text` `syntax` `table.border` `table.header` `rule` |
+| `color`, `background` | a name (`red`, `bright-blue`, `gray`, `default`), `"#rrggbb"`, or a number from 0 to 255. Names follow your terminal's theme; hex colours do not |
+| `bold` `italic` `underline` `dim` `strike` | `true` or `false` |
+
+Whatever you do not mention keeps its default, so `h1.underline = false` leaves the heading bold and its colour alone. `editor.style.h1.font.color` means the same as `editor.style.h1.color`. The one thing that cannot be set is the font itself: its size and family belong to the terminal, not to a program running in it (in Ghostty: `font-size` and `font-family`), so headings cannot be larger than the text. omanote says so if you try.
 
 Saving applies the settings straight away, with no restart. A line that makes no sense is reported and nothing changes. The footer and panels take their colours from your terminal's own background and foreground, so they follow its theme; `OMANOTE_COLORS=plain` turns that off. `Ctrl+L` repaints the screen if a terminal ever garbles it.
 

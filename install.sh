@@ -10,8 +10,13 @@
 #   OMANOTE_INSTALL_DIR=/usr/local/bin
 #   OMANOTE_REPO=owner/repo      a fork
 #
-# To remove it again:  … | sh -s -- --uninstall     (your notes in ~/.omanote stay)
+# To remove it again:  ... | sh -s -- --uninstall     (your notes in ~/.omanote stay)
 set -eu
+
+# Keep this file plain ASCII, and write ${name} wherever text follows a
+# variable. macOS runs /bin/sh as bash 3.2, which takes the bytes of a
+# character like an ellipsis as part of the variable's name: "$REPO..." with a
+# real ellipsis asks for a variable that does not exist, and set -u stops there.
 
 REPO="${OMANOTE_REPO:-iluxav/omanote}"
 VERSION="${OMANOTE_VERSION:-latest}"
@@ -57,8 +62,8 @@ fi
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
-say "Downloading $asset ($VERSION) from $REPO…"
-fetch "$base/$asset" "$tmp/$asset" || die "could not download $base/$asset — is there a release for this platform?"
+say "Downloading ${asset} (${VERSION}) from ${REPO}..."
+fetch "$base/$asset" "$tmp/$asset" || die "could not download ${base}/${asset} - is there a release for this platform?"
 
 if fetch "$base/checksums.txt" "$tmp/checksums.txt" 2>/dev/null; then
     want=$(awk -v f="$asset" '$2 == f || $2 == "*" f { print $1 }' "$tmp/checksums.txt")
@@ -72,7 +77,7 @@ if fetch "$base/checksums.txt" "$tmp/checksums.txt" 2>/dev/null; then
     if [ -z "$want" ] || [ -z "$got" ]; then
         say "Warning: could not verify the checksum, continuing."
     elif [ "$want" != "$got" ]; then
-        die "checksum mismatch for $asset — not installing"
+        die "checksum mismatch for ${asset} - not installing"
     else
         say "Checksum OK."
     fi
