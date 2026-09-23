@@ -2,6 +2,7 @@ mod agents;
 mod capture;
 mod clipboard;
 mod commands;
+mod complete;
 mod config;
 mod desktop;
 mod diacritics;
@@ -56,6 +57,8 @@ const AUTOSAVE_IDLE: Duration = Duration::from_millis(1500);
 const TOAST: Duration = Duration::from_secs(2);
 /// How long the typing has to pause before the spelling is checked.
 const SPELL_SETTLE: Duration = Duration::from_millis(400);
+/// How long the typing pauses before the type-ahead guesses what comes next.
+const GUESS_SETTLE: Duration = Duration::from_millis(300);
 const DOUBLE_CLICK: Duration = Duration::from_millis(350);
 /// How long `omanote <name>` waits for GitHub before giving up and starting a new note.
 const PULL_PATIENCE: Duration = Duration::from_secs(8);
@@ -91,6 +94,8 @@ struct App {
     spell: Option<spell::Checker>,
     /// The grammar model's checker, when its file is there, and what each checker last found.
     grammar: Option<grammar::Checker>,
+    /// What the running grammar checker reads with, to notice the settings change it.
+    grammar_backend: Option<grammar::Backend>,
     spelling_found: Vec<spell::Problem>,
     grammar_found: Vec<spell::Problem>,
     grammar_asked: u64,
@@ -141,6 +146,14 @@ struct App {
     enhanced_keys: bool,
     image_mode: images::Mode,
     settings: config::Config,
+    /// Type-ahead: who is asked, what was last asked (note, edit, cursor), and
+    /// the guess shown after the cursor.
+    completer: Option<complete::Completer>,
+    guess_asked: Option<(u64, u64, Pos)>,
+    guessing: bool,
+    ghost: Option<Ghost>,
+    /// When the settings file was last read, to notice it changing on disk.
+    settings_mtime: Option<std::time::SystemTime>,
     /// Redraw every cell on the next frame, not just what changed.
     repaint: bool,
     /// `--keys`: show and log every key event, for diagnosing terminal quirks.
@@ -162,19 +175,44 @@ impl App {
         if !self.ed.path.as_deref().is_some_and(|p| same(p, &file)) {
             return;
         }
+        match self.reload_settings(false) {
+            Ok(()) if explicit => self.say("Settings applied"),
+            Ok(()) => {}
+            Err(problem) if explicit => self.say(format!("Not applied — {problem}")),
+            Err(_) => {}
+        }
+    }
+
+    /// Read the settings file again and use it. A wrong line is returned; the
+    /// rest is still used when `partial` is on (at startup), and nothing is
+    /// otherwise, so a half-typed line never changes a running editor.
+    /// Remembers the file's time either way, so the same broken file is not
+    /// re-read a few times a second.
+    fn reload_settings(&mut self, partial: bool) -> Result<(), String> {
+        self.settings_mtime = std::fs::metadata(config::path(&vaults::home())).and_then(|m| m.modified()).ok();
         let (settings, problems) = config::load(&vaults::home());
-        match (problems.first(), explicit) {
-            (None, _) => {
-                look::apply(&settings.look);
-                self.settings = settings;
-                self.spell_setup();
-                self.repaint = true;
-                if explicit {
-                    self.say("Settings applied");
-                }
-            }
-            (Some(problem), true) => self.say(format!("Not applied — {problem}")),
-            (Some(_), false) => {}
+        let problem = problems.into_iter().next();
+        if problem.is_some() && !partial {
+            return Err(problem.unwrap_or_default());
+        }
+        look::apply(&settings.look);
+        self.settings = settings;
+        self.spell_setup();
+        self.complete_setup();
+        self.repaint = true;
+        problem.map_or(Ok(()), Err)
+    }
+
+    /// The settings file changed on disk: `omanote --config` in another
+    /// window, or an editor. Half-typed lines there fail quietly; the next
+    /// save that parses is taken up.
+    fn refresh_settings(&mut self) {
+        let on_disk = std::fs::metadata(config::path(&vaults::home())).and_then(|m| m.modified()).ok();
+        if on_disk == self.settings_mtime {
+            return;
+        }
+        if self.reload_settings(false).is_ok() {
+            self.say("Settings updated");
         }
     }
 
@@ -207,6 +245,7 @@ impl App {
             self.say(msg);
         }
         self.refresh_other();
+        self.refresh_settings();
         let Some(path) = self.ed.path.clone() else { return };
         let on_disk = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
         if on_disk.is_none() || on_disk == self.ed.disk_mtime {
@@ -769,7 +808,32 @@ impl App {
         self.quit = true;
     }
 
+    /// A key, with the type-ahead's guess in view: Tab takes it, Esc puts it
+    /// away, typing what it says keeps the rest of it, anything else drops it.
     fn key(&mut self, key: KeyEvent) {
+        if key.kind == KeyEventKind::Release || self.key_log.is_some() {
+            self.ghost = None;
+            return self.key_here(key);
+        }
+        let Some(ghost) = self.ghost.take().filter(|g| self.ghost_fits(g)) else { return self.key_here(key) };
+        let plain = key.modifiers.difference(KeyModifiers::SHIFT).is_empty();
+        match key.code {
+            KeyCode::Tab if key.modifiers.is_empty() => self.ed.insert_str(&ghost.text),
+            KeyCode::Esc => {}
+            KeyCode::Char(c) if plain && ghost.text.starts_with(c) => {
+                let (row, col) = (self.ed.cursor.row, self.ed.cursor.col);
+                self.key_here(key);
+                let typed = self.ed.cursor == Pos { row, col: col + 1 } && self.ed.lines[row].get(col) == Some(&c);
+                let rest = &ghost.text[c.len_utf8()..];
+                if typed && rest.chars().any(char::is_alphanumeric) {
+                    self.ghost = Some(Ghost { note: self.ed.id, edits: self.ed.edits, at: self.ed.cursor, text: rest.to_string() });
+                }
+            }
+            _ => self.key_here(key),
+        }
+    }
+
+    fn key_here(&mut self, key: KeyEvent) {
         if let Some(log) = &mut self.key_log {
             use std::io::Write;
             let line = format!("{:?} {:?} {:?}", key.code, key.modifiers, key.kind);
@@ -834,6 +898,86 @@ impl App {
     // ---- spelling ----------------------------------------------------------
 
     /// Start, stop or restart the checker to match the settings.
+    /// Type-ahead: start, stop or restart the asking to match the settings.
+    fn complete_setup(&mut self) {
+        let wanted = &self.settings.complete;
+        if self.completer.as_ref().map(|c| &c.settings) == Some(wanted).filter(|w| w.on()) {
+            return;
+        }
+        self.completer = wanted.on().then(|| complete::Completer::start(wanted.clone()));
+        (self.ghost, self.guess_asked, self.guessing) = (None, None, false);
+    }
+
+    /// Somewhere a guess makes sense: the end of a line of prose being
+    /// written, with nothing open over the note.
+    fn can_guess(&self) -> bool {
+        let ed = &self.ed;
+        let line = &ed.lines[ed.cursor.row];
+        let overlay = self.chooser.is_some() || self.picker.is_some() || self.save_as.is_some() || self.palette.is_some() || self.find.is_some() || self.fixer.is_some() || self.mention.is_some();
+        ed.markdown
+            && !overlay
+            && !self.pane_focused
+            && ed.selection().is_none()
+            && ed.cursor.col == line.len()
+            && line.iter().any(|c| !c.is_whitespace())
+            && matches!(ed.blocks.get(ed.cursor.row), Some(markdown::Block::Normal))
+    }
+
+    /// The guess still belongs where the cursor is: nothing typed or moved since.
+    fn ghost_fits(&self, ghost: &Ghost) -> bool {
+        ghost.note == self.ed.id && ghost.edits == self.ed.edits && ghost.at == self.ed.cursor && self.can_guess()
+    }
+
+    fn ghost_text(&self) -> Option<&str> {
+        self.ghost.as_ref().filter(|g| self.ghost_fits(g)).map(|g| g.text.as_str())
+    }
+
+    /// Ask for a guess once the typing pauses, and show what comes back.
+    /// Returns whether there is something new to draw.
+    fn complete_tick(&mut self) -> bool {
+        let Some(completer) = &self.completer else { return false };
+        let here = (self.ed.id, self.ed.edits, self.ed.cursor);
+        if self.guess_asked.is_none_or(|(note, edits, _)| (note, edits) != (here.0, here.1)) && self.ed.last_change.elapsed() >= GUESS_SETTLE && self.can_guess() {
+            let ed = &self.ed;
+            let mut before: String = ed.lines[..ed.cursor.row].iter().map(|l| l.iter().collect::<String>() + "\n").collect();
+            before.extend(&ed.lines[ed.cursor.row][..ed.cursor.col]);
+            completer.ask(here.1, &before);
+            self.guess_asked = Some(here);
+            self.guessing = true;
+        }
+        let mut answers = Vec::new();
+        while let Some(answer) = completer.answer() {
+            answers.push(answer);
+        }
+        let mut changed = false;
+        for (edits, answer) in answers {
+            let asked = self.guess_asked.filter(|&(note, e, _)| e == edits && note == self.ed.id);
+            if asked.is_some() {
+                self.guessing = false;
+            }
+            match answer {
+                Ok(text) => {
+                    let Some((note, edits, at)) = asked else { continue };
+                    // A space already typed is not typed twice.
+                    let after_space = self.ed.lines[at.row].last().is_some_and(|c| c.is_whitespace());
+                    let text = if after_space { text.trim_start().to_string() } else { text };
+                    if !text.is_empty() {
+                        self.ghost = Some(Ghost { note, edits, at, text });
+                        changed = true;
+                    }
+                }
+                Err(e) => {
+                    if let Some(c) = self.completer.as_mut().filter(|c| !c.complained) {
+                        c.complained = true;
+                        self.say(format!("Type-ahead: {e}"));
+                        changed = true;
+                    }
+                }
+            }
+        }
+        changed
+    }
+
     fn spell_setup(&mut self) {
         let wanted = (self.settings.spelling && self.checking).then(|| spell::dialect(&self.settings.dialect)).flatten();
         match (wanted, &self.spell) {
@@ -841,6 +985,7 @@ impl App {
             (None, Some(_)) => {
                 self.spell = None;
                 self.grammar = None;
+                self.grammar_backend = None;
                 self.problems.clear();
                 self.fixer = None;
             }
@@ -850,14 +995,30 @@ impl App {
                     self.spell_dialect = Some(dialect);
                     self.spell_asked = u64::MAX;
                 }
-                // The grammar model, if its file is there. It is English whatever the dialect.
-                let model = grammar::model_path();
-                if self.grammar.is_none() && model.exists() {
-                    self.grammar = Some(grammar::Checker::start(model));
+                // The grammar model, if its file is there, or the language model.
+                // It is English whatever the dialect.
+                let wanted = self.grammar_wanted();
+                if self.grammar.is_none() || self.grammar_backend != wanted {
+                    self.grammar = wanted.clone().map(grammar::Checker::start);
+                    self.grammar_backend = wanted;
                     self.grammar_asked = u64::MAX;
+                    self.grammar_found.clear();
                 }
             }
         }
+    }
+
+    /// What should read the grammar: the language model when the settings
+    /// say so (or have one, and say nothing), else the downloaded model if it
+    /// is there.
+    fn grammar_wanted(&self) -> Option<grammar::Backend> {
+        let complete = &self.settings.complete;
+        let llm = complete.on() && self.settings.grammar != config::Grammar::Builtin;
+        if llm {
+            return Some(grammar::Backend::Llm(complete.clone()));
+        }
+        let model = grammar::model_path();
+        model.exists().then_some(grammar::Backend::Builtin(model))
     }
 
     /// Ask for a check once the typing has paused, and take in what came
@@ -916,6 +1077,7 @@ impl App {
             }
             if let Some(why) = broken {
                 self.grammar = None;
+                self.grammar_backend = None;
                 self.say(format!("Grammar checking is off: {why}"));
             }
         }
@@ -990,12 +1152,16 @@ impl App {
             self.set_checking(false);
             return self.say("Spelling and grammar off · Shift+F7 turns them back on");
         }
-        if !grammar::model_path().exists() {
+        if self.grammar_wanted().is_none() {
             self.downloading = Some(grammar::Download::start(grammar::model_path()));
             return;
         }
         self.set_checking(true);
-        self.say(if self.settings.spelling { "Spelling and grammar on · Shift+F7 turns them off" } else { "Checking is on, but spelling = false in the settings keeps it off" });
+        let by = match &self.grammar_backend {
+            Some(grammar::Backend::Llm(s)) => format!(" (grammar by {})", s.model.trim()),
+            _ => String::new(),
+        };
+        self.say(if self.settings.spelling { format!("Spelling and grammar on{by} · Shift+F7 turns them off") } else { "Checking is on, but spelling = false in the settings keeps it off".to_string() });
     }
 
     fn set_checking(&mut self, on: bool) {
@@ -1007,6 +1173,7 @@ impl App {
         } else {
             self.spell = None;
             self.grammar = None;
+            self.grammar_backend = None;
             self.spell_dialect = None;
             self.problems.clear();
             self.spelling_found.clear();
@@ -1073,6 +1240,8 @@ impl App {
         let choices = fixer.choices();
         match choices.get(fixer.selected) {
             Some(spell::Choice::Fix(fix)) => {
+                // The fix is made on the problem's line, wherever the cursor is.
+                self.ed.move_to(Pos { row: problem.row, col: problem.from }, false);
                 match fix {
                     spell::Fix::Replace(with) => self.ed.replace_on_line(problem.from, problem.to, with),
                     spell::Fix::InsertAfter(with) => {
@@ -1177,7 +1346,8 @@ impl App {
 
     /// Ctrl+F, or F3 to carry on with the last search.
     fn open_find(&mut self, step: isize) {
-        let mut find = find::Find::open(&self.ed, &self.last_find);
+        // Ctrl+F starts afresh (from the selection, if there is one); F3 carries on.
+        let mut find = find::Find::open(&self.ed, if step == 0 { "" } else { &self.last_find });
         self.mention = None;
         self.toast = None;
         if step != 0 && !find.query.is_empty() {
@@ -1299,9 +1469,17 @@ impl App {
             self.ed.right(false);
         }
         let how = if self.enhanced_keys { "Ctrl+Enter" } else { "Ctrl+O" };
-        match got.create {
-            Some(path) => self.say(format!("Created {} · {how} opens it", path.file_name().unwrap_or_default().to_string_lossy())),
-            None => self.say(format!("Linked · {how} opens it")),
+        let Some(path) = got.create else { return self.say(format!("Linked · {how} opens it")) };
+        // A note made here is wanted now: open it beside this one, under its
+        // title, so the writing carries on there without leaving this note.
+        let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        self.open_aside(path.clone());
+        if self.ed.path.as_ref() == Some(&path) {
+            let last = self.ed.lines.len() - 1;
+            self.ed.move_to(Pos { row: last, col: self.ed.lines[last].len() }, false);
+            self.say(format!("Created {name} · F6 goes back to the other note"));
+        } else {
+            self.say(format!("Created {name} · {how} opens it"));
         }
     }
 
@@ -1763,11 +1941,17 @@ omanote — a small markdown note editor
                               F7 (or a click on the word) lists the fixes, Enter applies,
                               or adds the word to ~/.omanote/dictionary.txt. Checking is
                               off until Shift+F7 turns it on (the first time, it downloads
-                              the 78 MB grammar model); Shift+F7 again turns it off
+                              the 78 MB grammar model, unless complete.model names a language
+                              model, which then reads the grammar); Shift+F7 again turns it off
+  Tab after a guess           type-ahead: with complete.model in the settings, a word or two
+                              of what might come next shows dim at the end of the line; Tab
+                              takes it, Esc or any other key leaves it. Asks Ollama, or any
+                              OpenAI-style server when complete.url ends in /v1
   Ctrl+R inside the editor    your own commands: command.<name> = \"<anything a shell runs>\"
                               in the settings. The selection (or the paragraph) goes in,
                               what comes out takes its place: grammar, translation, dates
-  @ inside the editor         link a note: type @ and a few letters, pick from the list
+  @ inside the editor         link a note: type @ and a few letters, pick from the list;
+                              a note created there opens beside this one, ready to write
                               (the last entry creates a note by that name), Enter
   Ctrl+K                      make the selected text a link: [text](), with the cursor
                               where the address goes (type it, paste it, or @ to pick a
@@ -1942,6 +2126,14 @@ fn checking_on_file() -> PathBuf {
     vaults::home().join("checking-on")
 }
 
+/// The type-ahead's guess: what it says, and the note, edit and cursor it is for.
+struct Ghost {
+    note: u64,
+    edits: u64,
+    at: Pos,
+    text: String,
+}
+
 /// A note made from an `@` mention: just its title, ready to be written in.
 /// An existing file is left alone.
 fn start_note(path: &std::path::Path) -> std::io::Result<()> {
@@ -2073,6 +2265,7 @@ fn main() -> std::io::Result<()> {
         running: None,
         spell: None,
         grammar: None,
+        grammar_backend: None,
         spelling_found: Vec::new(),
         grammar_found: Vec::new(),
         grammar_asked: u64::MAX,
@@ -2097,6 +2290,11 @@ fn main() -> std::io::Result<()> {
         enhanced_keys,
         image_mode: images::detect(),
         settings: config::Config::default(),
+        settings_mtime: None,
+        completer: None,
+        guess_asked: None,
+        guessing: false,
+        ghost: None,
         repaint: false,
         key_log,
         quit: false,
@@ -2113,11 +2311,7 @@ fn main() -> std::io::Result<()> {
     }
 
     let all_vaults = vaults::all(&vaults::home());
-    let (settings, problems) = config::load(&vaults::home());
-    look::apply(&settings.look);
-    app.settings = settings;
-    app.spell_setup();
-    if let Some(first) = problems.first() {
+    if let Err(first) = app.reload_settings(true) {
         app.say(format!("config.toml, {first}"));
     }
     match start_agent.as_deref() {
@@ -2137,7 +2331,7 @@ fn main() -> std::io::Result<()> {
             if app.poll_command() {
                 redraw = true;
             }
-            if app.spell_tick() || app.poll_download() {
+            if app.spell_tick() || app.poll_download() || app.complete_tick() {
                 redraw = true;
             }
             // The assistant prints whenever it likes, so with the pane open we
@@ -2199,6 +2393,7 @@ fn main() -> std::io::Result<()> {
                 let back = app.history.iter().rev().find(|(p, _)| p.exists() && !app.is_other(p)).map(|(p, _)| p.file_name().unwrap_or_default().to_string_lossy().into_owned());
                 let place = |ed: &Editor| ed.path.as_ref().map(|p| vaults::place(p, &all_vaults)).unwrap_or_default();
                 let places = (place(&app.ed), app.other.as_ref().map(|o| place(&o.ed)).unwrap_or_default());
+                let ghost = app.ghost_text().map(str::to_string);
                 let scene = ui::Scene {
                     panes: &panes,
                     other: app.other.as_mut().map(|o| &mut o.ed),
@@ -2215,13 +2410,16 @@ fn main() -> std::io::Result<()> {
                     palette: app.palette.as_ref().map(|p| (p, app.settings.commands.as_slice())),
                     problems: &app.problems,
                     fixer: app.fixer.as_ref(),
+                    ghost: ghost.as_deref(),
                     back: back.as_deref(),
                     places: (&places.0, &places.1),
                 };
                 terminal.draw(|f| ui::draw(f, &mut app.ed, scene))?;
             }
 
-            let wait = Duration::from_millis(if app.pane.is_some() { 25 } else if app.running.is_some() { 80 } else { 250 });
+            // While a guess is due or on its way, look often enough that it shows without delay.
+            let guess_due = app.completer.is_some() && (app.guessing || app.ed.last_change.elapsed() < GUESS_SETTLE * 2);
+            let wait = Duration::from_millis(if app.pane.is_some() || guess_due { 25 } else if app.running.is_some() { 80 } else { 250 });
             let input = match watch_terminal(wait) {
                 Tty::Gone => {
                     STOP.store(true, Ordering::Relaxed);

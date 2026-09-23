@@ -708,10 +708,28 @@ pub fn check_line(model: &Model, line: &[char]) -> Result<Vec<Problem>, String> 
         }
         current = next;
     }
-    let fixed = &current[1..];
+    Ok(problems(line, &words, &current[1..], false))
+}
 
+/// The problems in `line` that turn its `words` into `fixed`, each offered
+/// as its final wording. `strict`, for a language model's rewrite: only what
+/// is plainly a mistake counts, not a comma it would add, a full stop, an
+/// accent, a capital mid-sentence or a phrase said its own way.
+fn problems(line: &[char], words: &[Word], fixed: &[String], strict: bool) -> Vec<Problem> {
+    let original: Vec<String> = words.iter().map(|w| w.text.clone()).collect();
+    let hunks = differences(&original, fixed);
+    if strict {
+        // Half the sentence changed is a rewrite, not a correction.
+        let changed: usize = hunks.iter().map(|(was, now)| was.len().max(now.len())).sum();
+        if changed * 2 > original.len() {
+            return Vec::new();
+        }
+    }
     let mut out = Vec::new();
-    for (was, now) in differences(&original, fixed) {
+    for (was, now) in hunks {
+        if strict && !plainly_a_mistake(&original[was.clone()], &fixed[now.clone()], was.start == 0) {
+            continue;
+        }
         let now: Vec<String> = fixed[now].to_vec();
         // Where the change sits: the words it replaces, or for a pure insertion
         // the word before it (the word after, at the start of the line).
@@ -750,7 +768,114 @@ pub fn check_line(model: &Model, line: &[char]) -> Result<Vec<Problem>, String> 
         };
         out.push(problem);
     }
+    out
+}
+
+/// A language model's change worth underlining: words, not punctuation; a
+/// short fix, not a rephrasing; more than an accent; and a capital only
+/// where a sentence starts, or for "I".
+fn plainly_a_mistake(was: &[String], now: &[String], starts_sentence: bool) -> bool {
+    let wordy = |ts: &[String]| ts.iter().any(|t| t.chars().any(char::is_alphanumeric));
+    if !wordy(was) && !wordy(now) {
+        return false;
+    }
+    if was.len() > 3 || now.len() > 3 {
+        return false;
+    }
+    let (a, b) = (join(was), join(now));
+    if a.to_lowercase() == b.to_lowercase() {
+        return starts_sentence || a == "i";
+    }
+    // "cafe" and "café": the same word.
+    let accent = |x: char, y: char| x == y || (x.is_ascii_alphabetic() != y.is_ascii_alphabetic() && x.is_alphabetic() && y.is_alphabetic());
+    let (a, b): (Vec<char>, Vec<char>) = (a.to_lowercase().chars().collect(), b.to_lowercase().chars().collect());
+    !(a.len() == b.len() && a.iter().zip(&b).all(|(x, y)| accent(*x, *y)))
+}
+
+// ---- a language model you run, as the checker
+
+const LLM_INSTRUCTIONS: &str = "You correct grammar and spelling mistakes in the user's sentence. Change as little as possible: fix only real errors, never rephrase, never change style, tone, or meaning. If the sentence is already correct, return it unchanged. Reply with the sentence only.";
+
+/// Correct sentences come back unchanged: shown, not only told.
+const LLM_EXAMPLES: [(&str, &str); 4] = [
+    ("We moved the launch because the payment was late.", "We moved the launch because the payment was late."),
+    ("we has three tree in the garden", "we have three trees in the garden"),
+    ("Honestly it was kinda fun", "Honestly it was kinda fun"),
+    ("Its done, lets ship it.", "It's done, let's ship it."),
+];
+
+/// The server, and what it said of each sentence it has read.
+struct Llm {
+    settings: crate::complete::Settings,
+    agent: ureq::Agent,
+    read: HashMap<String, Vec<String>>,
+}
+
+impl Llm {
+    /// The sentence as the model would write it, in words.
+    fn fixed(&mut self, sentence: &str) -> Result<Vec<String>, String> {
+        if let Some(words) = self.read.get(sentence) {
+            return Ok(words.clone());
+        }
+        // The guess after the cursor is what the typing waits on: let it go first.
+        let since = std::time::Instant::now();
+        while crate::complete::GUESSING.load(Ordering::Relaxed) && since.elapsed() < std::time::Duration::from_secs(3) {
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+        let tokens = sentence.len() / 2 + 16;
+        let reply = crate::complete::chat(&self.agent, &self.settings, LLM_INSTRUCTIONS, &LLM_EXAMPLES, sentence, tokens)?;
+        let reply = reply.trim().lines().next().unwrap_or("").trim();
+        // Quotes it put around the answer are not part of it.
+        let reply = match (reply.strip_prefix('"').and_then(|r| r.strip_suffix('"')), sentence.starts_with('"')) {
+            (Some(inner), false) => inner,
+            _ => reply,
+        };
+        let chars: Vec<char> = reply.chars().collect();
+        let fixed: Vec<String> = words(&chars).into_iter().map(|w| w.text).collect();
+        if self.read.len() > CACHE_LINES {
+            self.read.clear();
+        }
+        self.read.insert(sentence.to_string(), fixed.clone());
+        Ok(fixed)
+    }
+}
+
+/// Check one line with a language model, a sentence at a time: a sentence
+/// already read is not asked about again.
+fn check_line_llm(llm: &mut Llm, line: &[char]) -> Result<Vec<Problem>, String> {
+    let words = words(line);
+    if words.iter().filter(|w| w.text.chars().any(char::is_alphabetic)).count() < 2 {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for sentence in sentences(&words) {
+        let words = &words[sentence];
+        if words.iter().filter(|w| w.text.chars().any(char::is_alphabetic)).count() < 2 {
+            continue;
+        }
+        let text: String = line[words[0].from..words[words.len() - 1].to].iter().collect();
+        let fixed = llm.fixed(&text)?;
+        if !fixed.is_empty() {
+            out.extend(problems(line, words, &fixed, true));
+        }
+    }
     Ok(out)
+}
+
+/// The sentences among a line's words: each ends after a . ! or ?
+fn sentences(words: &[Word]) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for (i, w) in words.iter().enumerate() {
+        if matches!(w.text.as_str(), "." | "!" | "?") {
+            out.push(start..i + 1);
+            start = i + 1;
+        }
+    }
+    if start < words.len() {
+        out.push(start..words.len());
+    }
+    out
 }
 
 // ---- the thread
@@ -766,17 +891,30 @@ pub enum News {
     Loaded,
 }
 
+/// What reads the sentences: the model downloaded for it, or a language
+/// model you run yourself (`complete.*` in the settings).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Backend {
+    Builtin(PathBuf),
+    Llm(crate::complete::Settings),
+}
+
+enum Reader {
+    Builtin(Box<Model>),
+    Llm(Llm),
+}
+
 pub struct Checker {
     jobs: Sender<Job>,
     news: Receiver<News>,
 }
 
 impl Checker {
-    pub fn start(path: PathBuf) -> Self {
+    pub fn start(backend: Backend) -> Self {
         let (jobs, inbox) = channel::<Job>();
         let (tell, news) = channel();
         std::thread::spawn(move || {
-            let mut model: Option<Model> = None;
+            let mut model: Option<Reader> = None;
             let mut gone = false;
             let mut cache: HashMap<String, Vec<Problem>> = HashMap::new();
             let mut pending: Option<Job> = None;
@@ -794,7 +932,11 @@ impl Checker {
                     (n, lines) = (n2, l2);
                 }
                 if model.is_none() && !gone {
-                    match Model::load(&path) {
+                    let loaded = match &backend {
+                        Backend::Builtin(path) => Model::load(path).map(|m| Reader::Builtin(Box::new(m))),
+                        Backend::Llm(settings) => Ok(Reader::Llm(Llm { settings: settings.clone(), agent: crate::complete::agent(), read: HashMap::new() })),
+                    };
+                    match loaded {
                         Ok(m) => {
                             model = Some(m);
                             let _ = tell.send(News::Loaded);
@@ -805,7 +947,7 @@ impl Checker {
                         }
                     }
                 }
-                let Some(m) = &model else { continue };
+                let Some(m) = &mut model else { continue };
                 if cache.len() > CACHE_LINES {
                     cache.clear();
                 }
@@ -820,7 +962,17 @@ impl Checker {
                         Some(p) => p.clone(),
                         None => {
                             let chars: Vec<char> = text.chars().collect();
-                            let p = check_line(m, &chars).unwrap_or_default();
+                            let p = match m {
+                                Reader::Builtin(m) => check_line(m, &chars).unwrap_or_default(),
+                                Reader::Llm(llm) => match check_line_llm(llm, &chars) {
+                                    Ok(p) => p,
+                                    // The server is not there: say so once, and stop asking.
+                                    Err(e) => {
+                                        let _ = tell.send(News::Unavailable(e));
+                                        return;
+                                    }
+                                },
+                            };
                             cache.insert(text, p.clone());
                             p
                         }
@@ -1007,6 +1159,37 @@ fn fetch(url: &str, to: &Path, got: &AtomicU64, total: &AtomicU64, stop: &Atomic
 
 #[cfg(test)]
 mod tests {
+
+    fn strict(line: &str, fixed: &str) -> Vec<(String, String)> {
+        let line: Vec<char> = line.chars().collect();
+        let fixed: Vec<String> = words(&fixed.chars().collect::<Vec<_>>()).into_iter().map(|w| w.text).collect();
+        problems(&line, &words(&line), &fixed, true).into_iter().map(|p| (p.word, p.fixes[0].label())).collect()
+    }
+
+    #[test]
+    fn a_language_models_mistakes_are_kept_and_its_taste_is_not() {
+        let pair = |a: &str, b: &str| vec![(a.to_string(), b.to_string())];
+        assert_eq!(strict("We stayed for tree nights.", "We stayed for three nights."), pair("tree", "three"));
+        assert_eq!(strict("we has a meeting", "we have a meeting"), pair("has", "have"));
+        assert_eq!(strict("Its a nice day", "It's a nice day"), pair("Its", "It's"));
+        assert_eq!(strict("ho are you", "How are you"), pair("ho", "How"));
+        assert_eq!(strict("i think so", "I think so"), pair("i", "I"));
+        // Its taste: commas, a full stop, an accent, a capital after a colon, a rewrite.
+        assert!(strict("Honestly it was weird but whatever", "Honestly, it was weird, but whatever").is_empty());
+        assert!(strict("Bought milk, eggs and bread", "Bought milk, eggs and bread.").is_empty());
+        assert!(strict("We met at the cafe", "We met at the café").is_empty());
+        assert!(strict("TODO: fix the login bug", "TODO: Fix the login bug").is_empty());
+        assert!(strict("me and him went", "he and I went there together today").is_empty());
+    }
+
+    #[test]
+    fn a_line_is_read_a_sentence_at_a_time() {
+        let line: Vec<char> = "It rained. We stayed in! Then what".chars().collect();
+        let ws = words(&line);
+        let texts: Vec<String> = sentences(&ws).into_iter().map(|r| ws[r].iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ")).collect();
+        assert_eq!(texts, ["It rained .", "We stayed in !", "Then what"]);
+    }
+
     use super::*;
 
     fn w(line: &str) -> Vec<(String, usize, usize)> {

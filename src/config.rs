@@ -13,6 +13,16 @@ pub enum Align {
     Right,
 }
 
+/// What checks the grammar: the model omanote downloads for it, or the
+/// language model named for type-ahead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Grammar {
+    /// The language model when there is one, else the built-in.
+    Auto,
+    Builtin,
+    Llm,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
     /// Widest the text column gets, in characters. 0 = as wide as the window.
@@ -31,11 +41,14 @@ pub struct Config {
     /// Spelling and grammar, checked as you write, and in which English.
     pub spelling: bool,
     pub dialect: String,
+    pub grammar: Grammar,
+    /// `complete.*`: type-ahead from a language model of your own.
+    pub complete: crate::complete::Settings,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { width: 84, align: Align::Center, margin: 2, assistant: None, agents: Vec::new(), look: Look::default(), commands: Vec::new(), spelling: true, dialect: "american".into() }
+        Config { width: 84, align: Align::Center, margin: 2, assistant: None, agents: Vec::new(), look: Look::default(), commands: Vec::new(), spelling: true, dialect: "american".into(), grammar: Grammar::Auto, complete: Default::default() }
     }
 }
 
@@ -113,6 +126,30 @@ margin = 2
 # Words of your own go in ~/.omanote/dictionary.txt (F7 puts them there).
 # spelling = false
 # spelling.dialect = "british"     # american (the default), british, canadian, australian, indian
+#
+# Grammar is read by a small model omanote downloads, or, once complete.model
+# names a language model (below), by that one: it knows more, and there is
+# nothing to download. It is sent each sentence you change, to the same address.
+# "auto", the default, uses the language model when there is one; "builtin"
+# always the small model; "llm" always the language model.
+# spelling.grammar = "builtin"
+
+# Type-ahead: as you write, a word or two of what might come next shows dim
+# after the cursor, and Tab takes it. The guess comes from a language model
+# you run yourself; naming one turns it on. What you are writing is sent to
+# the address below as you type, so point it at a server you trust.
+#
+# The default address is Ollama's (https://ollama.com). An address ending in
+# /v1 is asked as an OpenAI-style server instead: llama.cpp, LM Studio, vLLM.
+# complete.model = "qwen3.5:9b"
+# complete.url = "http://localhost:11434"
+# complete.key = "..."          # for a server that wants a key
+# complete.words = 3            # the most words a guess shows
+#
+# The model's context window, in tokens, and about how many characters of the
+# note are sent. Ollama sets aside memory for all of it, and a model's own
+# window (often 131072) can take gigabytes. Other servers set it themselves.
+# complete.context = 2048
 "##;
 
 pub fn path(home: &Path) -> PathBuf {
@@ -178,13 +215,57 @@ fn with_new_sections(current: &str) -> String {
             (None, None) => {}
         }
     }
+    let mut missing_lines = Vec::new();
     for (topic, text) in sections {
         if !mentions(&topic) {
             out.push_str("\n\n");
             out.push_str(text.trim_end());
+        } else {
+            missing_lines.push((topic, text));
+        }
+    }
+    // A section the file has, from before a setting was added to it: the new
+    // setting, with the comment above it, goes after the section's last line.
+    for (topic, text) in missing_lines {
+        for chunk in new_settings(&text, current) {
+            let lines: Vec<&str> = out.lines().collect();
+            let last = lines.iter().rposition(|l| setting_key(l).is_some_and(|k| k == topic || k.starts_with(&format!("{topic}."))));
+            let at = last.map_or(lines.len(), |i| i + 1);
+            let mut grown: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+            grown.splice(at..at, chunk);
+            out = grown.join("\n");
         }
     }
     out.push('\n');
+    out
+}
+
+/// The name a line sets, commented out or not: `spelling.grammar` for
+/// `# spelling.grammar = "llm"`. Prose with an `=` in it names nothing.
+fn setting_key(line: &str) -> Option<&str> {
+    let (key, _) = line.trim_start_matches('#').trim().split_once('=')?;
+    let key = key.trim();
+    (!key.is_empty() && !key.contains(['<', ' ']) && key.chars().all(|c| c.is_ascii_lowercase() || c == '.' || c == '_')).then_some(key)
+}
+
+/// The settings in a template section that `current` never mentions, each
+/// with the comment lines just above it.
+fn new_settings(section: &str, current: &str) -> Vec<Vec<String>> {
+    let known: std::collections::HashSet<&str> = current.lines().filter_map(setting_key).collect();
+    let mut out = Vec::new();
+    let mut comment: Vec<String> = Vec::new();
+    for line in section.lines() {
+        match setting_key(line) {
+            Some(key) => {
+                if !known.contains(key) {
+                    comment.push(line.to_string());
+                    out.push(std::mem::take(&mut comment));
+                }
+                comment.clear();
+            }
+            None => comment.push(line.to_string()),
+        }
+    }
     out
 }
 
@@ -240,6 +321,24 @@ fn parse(text: &str) -> (Config, Vec<String>) {
                 Some(_) => config.dialect = value.trim().to_lowercase(),
                 None => problems.push(format!("line {}: the dialect is \"american\", \"british\", \"canadian\", \"australian\" or \"indian\", not `{value}`", n + 1)),
             },
+            "complete.model" => config.complete.model = value.to_string(),
+            "complete.url" if value.starts_with("http://") || value.starts_with("https://") => config.complete.url = value.trim_end_matches('/').to_string(),
+            "complete.url" => problems.push(format!("line {}: complete.url is an address starting with http:// or https://", n + 1)),
+            "complete.key" => config.complete.key = value.to_string(),
+            "complete.words" => match value.parse::<usize>() {
+                Ok(words @ 1..=20) => config.complete.words = words,
+                _ => problems.push(format!("line {}: complete.words is a number from 1 to 20", n + 1)),
+            },
+            "complete.context" => match value.parse::<usize>() {
+                Ok(tokens @ 256..=262_144) => config.complete.context = tokens,
+                _ => problems.push(format!("line {}: complete.context is a number of tokens from 256 to 262144", n + 1)),
+            },
+            "spelling.grammar" => match value.to_lowercase().as_str() {
+                "auto" => config.grammar = Grammar::Auto,
+                "builtin" | "built-in" | "gector" => config.grammar = Grammar::Builtin,
+                "llm" | "complete" => config.grammar = Grammar::Llm,
+                _ => problems.push(format!("line {}: spelling.grammar is \"auto\", \"builtin\" or \"llm\", not `{value}`", n + 1)),
+            },
             command if command.starts_with("command.") => {
                 if let Err(problem) = crate::commands::set(&mut config.commands, &command["command.".len()..], value) {
                     problems.push(format!("line {}: {problem}", n + 1));
@@ -259,6 +358,9 @@ fn parse(text: &str) -> (Config, Vec<String>) {
             },
             other => problems.push(format!("line {}: unknown setting `{other}`", n + 1)),
         }
+    }
+    if config.grammar == Grammar::Llm && !config.complete.on() {
+        problems.push("spelling.grammar = \"llm\" needs a model: complete.model = \"<name>\"".into());
     }
     (config, problems)
 }
@@ -323,11 +425,31 @@ mod tests {
     }
 
     #[test]
+    fn grammar_can_be_read_by_the_language_model() {
+        assert_eq!(parse("").0.grammar, Grammar::Auto);
+        assert_eq!(parse("spelling.grammar = builtin").0.grammar, Grammar::Builtin);
+        let (config, problems) = parse("spelling.grammar = \"llm\"\ncomplete.model = \"llama3.2:3b\"");
+        assert!(config.grammar == Grammar::Llm && problems.is_empty(), "{problems:?}");
+        let (_, problems) = parse("spelling.grammar = llm");
+        assert!(problems.len() == 1 && problems[0].contains("complete.model"), "{problems:?}");
+        assert_eq!(parse("spelling.grammar = maybe").1.len(), 1);
+    }
+
+    #[test]
+    fn type_ahead_is_off_until_a_model_is_named() {
+        assert!(!parse(TEMPLATE).0.complete.on());
+        let (config, problems) = parse("complete.model = \"qwen3.5:9b\"\ncomplete.url = \"http://box:8080/v1/\"\ncomplete.words = 2\ncomplete.words = 0\ncomplete.url = localhost\ncomplete.context = 4096\ncomplete.context = 10");
+        assert!(config.complete.on());
+        assert_eq!((config.complete.url.as_str(), config.complete.words, config.complete.context), ("http://box:8080/v1", 2, 4096));
+        assert_eq!(problems.len(), 3, "{problems:?}");
+    }
+
+    #[test]
     fn an_old_settings_file_learns_about_new_settings() {
         let old = "# omanote settings.\n\nwidth = 100\n\nalign = \"center\"\n\nmargin = 2\n";
         let grown = with_new_sections(old);
         assert!(grown.starts_with(old.trim_end()), "what was there is untouched");
-        for topic in ["agent.", "editor.style.", "command.", "spelling"] {
+        for topic in ["agent.", "editor.style.", "command.", "spelling", "complete."] {
             assert!(grown.contains(topic), "{topic} was added");
         }
         assert_eq!(grown.matches("width = ").count(), 1, "nothing is added twice");
@@ -338,6 +460,20 @@ mod tests {
         // A commented-out mention counts as knowing about it.
         let knows = format!("{old}\n# spelling = false\n");
         assert!(!with_new_sections(&knows).contains("Spelling and grammar are checked"));
+    }
+
+    #[test]
+    fn a_setting_added_to_a_section_the_file_has_is_added_too() {
+        let old = "width = 100\n\n# spelling = false\n# spelling.dialect = \"british\"\n\ncomplete.model = \"llama3.2:3b\"\n# complete.words = 3\n\n# the end\n";
+        let grown = with_new_sections(old);
+        let lines: Vec<&str> = grown.lines().collect();
+        let at = |needle: &str| lines.iter().position(|l| l.contains(needle)).unwrap_or_else(|| panic!("{needle} missing:\n{grown}"));
+        assert!(at("spelling.dialect") < at("spelling.grammar") && at("spelling.grammar") < at("complete.model = \"llama"), "{grown}");
+        assert!(at("complete.words") < at("complete.context") && at("complete.context") < at("# the end"), "{grown}");
+        assert!(at("Grammar is read by") + 5 == at("spelling.grammar = \"builtin\""), "its comment comes with it:\n{grown}");
+        assert_eq!(grown.matches("spelling.dialect").count(), 1);
+        assert_eq!(with_new_sections(&grown), grown, "added once");
+        assert!(parse(&grown).1.is_empty());
     }
 
 }

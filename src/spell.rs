@@ -134,7 +134,7 @@ pub struct Checker {
 /// Rules that are more taste than error, and get in the way of notes.
 const QUIET: [&str; 3] = ["UseTitleCase", "SentenceCapitalization", "LongSentences"];
 
-fn dictionary(home: &Path) -> Arc<MergedDictionary> {
+pub fn dictionary(home: &Path) -> Arc<MergedDictionary> {
     let mut merged = MergedDictionary::new();
     merged.add_dictionary(FstDictionary::curated());
     let mut own = MutableDictionary::new();
@@ -208,6 +208,9 @@ impl Checker {
         std::thread::spawn(move || {
             let mut dict = None;
             let mut linter_ = None;
+            // When the dictionary file was read: another omanote, or a hand
+            // edit, may add to it, and the next check takes that in.
+            let mut read_at = None;
             while let Ok(mut job) = inbox.recv() {
                 // Only the latest text matters; the ones typed over in the meantime do not.
                 while let Ok(newer) = inbox.try_recv() {
@@ -230,7 +233,9 @@ impl Checker {
                         dict = None;
                     }
                     Job::Check(n, text) => {
-                        if dict.is_none() {
+                        let changed = std::fs::metadata(dictionary_file(&home_for_thread)).and_then(|m| m.modified()).ok();
+                        if dict.is_none() || changed != read_at {
+                            read_at = changed;
                             let d = dictionary(&home_for_thread);
                             linter_ = Some(linter(d.clone(), dialect));
                             dict = Some(d);
@@ -289,6 +294,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).unwrap();
         home
+    }
+
+    /// The answer to check `n`, waited for.
+    fn answer(checker: &Checker, n: u64) -> Vec<Problem> {
+        // Loading the dictionary is slow in a debug build, with other tests running.
+        for _ in 0..6000 {
+            while let Some((got, found)) = checker.results() {
+                if got == n {
+                    return found;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("check {n} was not answered");
+    }
+
+    #[test]
+    fn a_word_learnt_in_one_window_is_known_in_the_other() {
+        let home = std::env::temp_dir().join(format!("omanote-spell-shared-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let (here, there) = (Checker::start(&home, dialect("american").unwrap()), Checker::start(&home, dialect("american").unwrap()));
+        there.check(1, "the zorbleflux is here".into());
+        let first = answer(&there, 1);
+        assert!(first.iter().any(|p| p.word == "zorbleflux"), "{first:?}");
+        here.learn("zorbleflux");
+        for _ in 0..300 {
+            if std::fs::read_to_string(dictionary_file(&home)).unwrap_or_default().contains("zorbleflux") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        there.check(2, "the zorbleflux is here".into());
+        assert!(answer(&there, 2).is_empty(), "the other window read the dictionary again");
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]

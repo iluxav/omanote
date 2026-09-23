@@ -88,7 +88,7 @@ In `Ctrl+P`, start with `>` and the search is for what your notes say instead of
 
 ### Linking notes
 
-Type `@` and start typing a name. A list of matching notes from your vaults opens under the cursor and narrows as you type; its last entry is always **Create “name.md”**, for a note that does not exist yet. `↑` `↓` choose, `Enter` turns the `@name` into a link, `Esc` (or just carrying on with your sentence) closes the list. An `@` in the middle of a word, such as an e-mail address, does nothing.
+Type `@` and start typing a name. A list of matching notes from your vaults opens under the cursor and narrows as you type; its last entry is always **Create “name.md”**, for a note that does not exist yet. `↑` `↓` choose, `Enter` turns the `@name` into a link, `Esc` (or just carrying on with your sentence) closes the list. A note created this way opens on the right, with the cursor under its title, so you can write it straight away and `F6` back when you are done. An `@` in the middle of a word, such as an e-mail address, does nothing.
 
 The link is ordinary markdown with a relative path, `[trip plan](trips/trip%20plan.md)`, so it also works on GitHub and in any other markdown tool. A created note starts with its name as a heading, in the same folder as the note you are writing.
 
@@ -150,7 +150,32 @@ spelling.dialect = "british"      # american (the default), british, canadian, a
 editor.style.spelling.color = "yellow"   # the underline's colour
 ```
 
+#### Grammar from your own language model
+
+With a model set up for [type-ahead](#type-ahead), grammar is read by that model instead of the small built-in one, and there is nothing to download. It knows more: in a test, a 3B model caught every error given to it, and chose the fix that fits the sentence ("we has a great time" becomes "had", not "have"). Each sentence is sent once, when you write or change it, to the same address as the guesses, which go first when both are waiting.
+
+A language model also likes to improve sentences that were fine. Its changes are underlined only when they plainly fix a mistake. Commas and full stops it would add, accents (`cafe`, `café`), a capital letter mid-sentence and anything that rewrites more than a few words are left alone.
+
+```toml
+spelling.grammar = "builtin"      # auto (the default): the language model if there is one; builtin; or llm
+```
+
 It checks the note you are writing in, a moment after you pause; plain-text files are left alone. It cannot know that "tree nights" should be "three": for wrong-but-real words and for rephrasing, a command that hands the paragraph to an AI (below) is the tool.
+
+### Type-ahead
+
+With a language model running on your machine, omanote can guess what comes next as you write. At the end of a line, after a short pause, a word or two appears dim after the cursor. `Tab` takes it, `Esc` puts it away, and anything else you type carries on as usual. Typing the same letters as the guess keeps the rest of it in view, and `Ctrl+Z` removes a guess you took. In the middle of a word, the guess finishes that word first, and only with a word the spelling dictionary knows: a model left to itself in the middle of a word tends to misspell it, so no guess is better than a wrong one.
+
+It is off until you name a model in the settings (`omanote --config`):
+
+```toml
+complete.model = "qwen3.5:9b"
+complete.url = "http://localhost:11434"   # the default: Ollama
+complete.words = 3                        # the most words a guess shows
+complete.context = 2048                   # context window, in tokens
+```
+
+A plain address is asked as [Ollama](https://ollama.com), in raw mode, so the model continues your text instead of replying to it. An address ending in `/v1` is asked as an OpenAI-style `/completions` server, such as llama.cpp, LM Studio or vLLM, with `complete.key` sent as a bearer token if you set one. Guesses come only at the end of a line of prose, never in code blocks or tables. A model that fits in your GPU's memory answers in a fraction of a second; one that does not will feel too slow to be useful. Ollama sets aside GPU memory for a model's whole context window, and a model's own window is often 131,072 tokens, which can take many gigabytes for a 2 GB model. So omanote asks for a small one, `complete.context`, 2,048 tokens unless you change it. Other servers choose the window themselves. About as many characters of the note as the window has tokens are sent: everything before the cursor, up to that much, goes to that address as you type, so point it at a server you trust.
 
 ### Your own commands
 

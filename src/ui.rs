@@ -5,6 +5,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::agents::Chooser;
 use crate::commands::{Command, Output, Palette, key_name};
@@ -144,13 +145,15 @@ pub struct Scene<'a> {
     /// What the spelling check found in the focused note, and the fix list if it is open.
     pub problems: &'a [Problem],
     pub fixer: Option<&'a Fixer>,
+    /// The type-ahead's guess, shown dim after the cursor.
+    pub ghost: Option<&'a str>,
     pub back: Option<&'a str>,
     /// Where each note is (`vault/folder/`): the focused one's, then the other's.
     pub places: (&'a str, &'a str),
 }
 
 pub fn draw(f: &mut Frame, ed: &mut Editor, scene: Scene) {
-    let Scene { panes, other, on_right, picker, save_as, toast, sync, config, assistant, chooser, mention, find, palette, problems, fixer, back, places } = scene;
+    let Scene { panes, other, on_right, picker, save_as, toast, sync, config, assistant, chooser, mention, find, palette, problems, fixer, ghost, back, places } = scene;
     if let (Some((pane, focused)), Some(rect)) = (assistant, panes.agent) {
         if let Some(xy) = draw_pane(f, pane, rect, focused) {
             f.set_cursor_position(xy);
@@ -175,7 +178,7 @@ pub fn draw(f: &mut Frame, ed: &mut Editor, scene: Scene) {
         let rule: Vec<Line> = (0..panes.left.height).map(|_| Line::styled("│", theme::get().faint())).collect();
         f.render_widget(Paragraph::new(rule), Rect::new(x, panes.left.y, 1, panes.left.height));
     }
-    let focus = Focus { toast, sync, back, split, find, cursor: !typing_in_pane };
+    let focus = Focus { toast, sync, back, split, find, cursor: !typing_in_pane, ghost };
     let cursor_xy = draw_note(f, ed, mine, config, places.0, problems, Some(focus));
 
     let area = panes.notes();
@@ -202,6 +205,7 @@ struct Focus<'a> {
     split: bool,
     find: Option<&'a Find>,
     cursor: bool,
+    ghost: Option<&'a str>,
 }
 
 /// One note in its column: the text, and its footer. Returns where the cursor is.
@@ -246,6 +250,28 @@ fn draw_note(f: &mut Frame, ed: &mut Editor, area: Rect, config: &Config, place:
     }
 
     f.render_widget(Paragraph::new(out), Rect::new(x, 1, right_edge - x, h));
+
+    // The type-ahead's guess after the cursor. What does not fit before the
+    // column's edge goes on the next row, when that row is empty.
+    let ghost = focus.as_ref().filter(|f| f.cursor).and_then(|f| f.ghost);
+    if let (Some(ghost), Some((cx, cy))) = (ghost, cursor_xy) {
+        let style = theme::get().muted().add_modifier(Modifier::ITALIC);
+        let (mut here, mut rest) = split_at_width(ghost, (x + w).saturating_sub(cx) as usize);
+        // Break between words, as the text itself will once it is taken.
+        if let Some(space) = here.rfind(char::is_whitespace).filter(|_| !rest.is_empty() && !rest.starts_with(char::is_whitespace)) {
+            (here, rest) = ghost.split_at(space);
+        }
+        let rest = rest.trim_start();
+        let below = cy + 1;
+        let room_below = below < 1 + h && (x..x + (rest.width() as u16).min(w)).all(|col| f.buffer_mut()[(col, below)].symbol().trim().is_empty());
+        if !here.is_empty() {
+            f.render_widget(Paragraph::new(Line::styled(here.to_string(), style)), Rect::new(cx, cy, (x + w).saturating_sub(cx), 1));
+        }
+        if !rest.is_empty() && room_below {
+            let (fits, _) = split_at_width(rest, w as usize);
+            f.render_widget(Paragraph::new(Line::styled(fits.to_string(), style)), Rect::new(x, below, w, 1));
+        }
+    }
 
     // The footer: a band across the column, set apart from the page.
     let look = theme::get();
@@ -890,4 +916,16 @@ mod tests {
         let (x1, _, w1, _, _) = text_area(Rect::new(66, 0, 60, 30), &config).unwrap();
         assert_eq!((x1, w1), (x0 + 66, w0));
     }
+}
+
+/// `text` cut where it reaches `room` columns: what fits, and what is left.
+fn split_at_width(text: &str, room: usize) -> (&str, &str) {
+    let mut used = 0;
+    for (i, c) in text.char_indices() {
+        used += c.width().unwrap_or(0);
+        if used > room {
+            return text.split_at(i);
+        }
+    }
+    (text, "")
 }

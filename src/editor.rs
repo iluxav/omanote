@@ -294,7 +294,14 @@ impl Editor {
         let len = self.lines[row].len();
         self.anchor = Some(Pos { row, col: from.min(len) });
         self.cursor = Pos { row, col: to.min(len) };
-        self.insert_str(text);
+        // Nothing to put in its place: the text just goes. (Inserting nothing does nothing.)
+        if text.is_empty() {
+            if from < to.min(len) {
+                self.delete();
+            }
+        } else {
+            self.insert_str(text);
+        }
         self.anchor = None;
     }
 
@@ -1181,6 +1188,18 @@ impl Editor {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn replacing_with_nothing_removes_the_text() {
+        let mut ed = Editor::new("a description of a the editor", None);
+        ed.replace_on_line(16, 18, "");
+        assert_eq!(ed.lines[0].iter().collect::<String>(), "a description of the editor");
+        ed.undo();
+        assert_eq!(ed.lines[0].iter().collect::<String>(), "a description of a the editor");
+        ed.replace_on_line(5, 5, "");
+        assert_eq!(ed.lines[0].iter().collect::<String>(), "a description of a the editor", "an empty span removes nothing");
+    }
+
     use super::*;
 
     fn ed(text: &str) -> Editor {
