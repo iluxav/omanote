@@ -261,7 +261,7 @@ $include /etc/inputrc
 
 Then `omarchy restart terminal`. `Super+V` works as it is.
 
-`omanote --capture "call the dentist"` is what quick capture runs: it appends a line to `inbox.md` in your default vault, under a heading for the day, without opening the editor.
+`omanote --capture "call the dentist"` is what quick capture runs: it appends a line to `inbox.md` in your default vault, under a heading for the day, without opening the editor. With no text after it, the line is read from standard input (`echo "call the dentist" | omanote --capture`), which keeps what you wrote out of the process list; the quick-capture box sends it that way.
 
 ### Reminders
 

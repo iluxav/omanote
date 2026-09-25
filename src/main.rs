@@ -1974,6 +1974,7 @@ omanote — a small markdown note editor
 
 Quick notes and reminders:
   omanote --capture <text>    add a line to inbox.md in the default vault, without the editor
+                              (with no text, it is read from standard input)
   omanote --capture \"call the dentist !tomorrow 9:00\"
                               …and be reminded: end with ! and a time. !30m  !2h  !15:30
                               !fri 10:00  !2026-09-25 14:00, or what repeats:
@@ -2058,10 +2059,16 @@ fn cli(args: &[String]) -> Result<(Target, bool, bool, Option<String>, Land), St
                 return Ok((Target::New(name.join(" ")), keys, demo, agent, None));
             }
             "--capture" => {
-                // Everything after the flag is the note, quoted or not.
-                let text: Vec<String> = it.by_ref().cloned().collect();
+                // Everything after the flag is the note, quoted or not. With
+                // nothing after it, the note is read from standard input: a
+                // program capturing for you (the Omarchy popup) keeps it out
+                // of the process list that way, where any other program can read it.
+                let mut text = it.by_ref().cloned().collect::<Vec<String>>().join(" ");
+                if text.is_empty() && !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut text).map_err(|e| format!("cannot read the note from standard input: {e}"))?;
+                }
                 let vault = vaults::all(&home).first().map(|v| v.path.clone()).unwrap_or_default();
-                capture::capture(&vault, &text.join(" "), true)?
+                capture::capture(&vault, &text, true)?
             }
             "--remind" => {
                 // What the timer runs, every minute. Says nothing unless asked to by a failure.
