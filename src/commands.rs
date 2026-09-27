@@ -377,6 +377,13 @@ impl Running {
         if !done.ok {
             let why = first(&done.stderr);
             let why = if why.is_empty() { first(&done.stdout) } else { why };
+            // The shell's way of saying the program is not installed, cut
+            // down to the program: `bash: line 1: stylua: command not found`.
+            let missing = why.strip_suffix(": command not found").or_else(|| why.strip_suffix(": not found"));
+            let why = match missing.and_then(|m| m.rsplit(": ").next()) {
+                Some(program) => format!("{program} is not installed"),
+                None => why,
+            };
             return Outcome::Said(format!("{} failed{}", self.name, if why.is_empty() { String::new() } else { format!(": {why}") }));
         }
         // One trailing line break is the command ending its output, not part of the text.
@@ -572,6 +579,8 @@ mod tests {
         assert_eq!(wait(&running, &mut ed).0, "Test: 42 words");
         let running = start(&command("echo oops >&2; exit 3", Output::Insert), &ed, Path::new("/")).unwrap();
         assert_eq!(wait(&running, &mut ed).0, "Test failed: oops");
+        let running = start(&command("no-such-formatter-omanote", Output::Insert), &ed, Path::new("/")).unwrap();
+        assert_eq!(wait(&running, &mut ed).0, "Test failed: no-such-formatter-omanote is not installed");
         let running = start(&command("true", Output::Insert), &ed, Path::new("/")).unwrap();
         assert!(wait(&running, &mut ed).0.contains("said nothing"));
         assert_eq!(ed.text(), before, "none of those touched the note");

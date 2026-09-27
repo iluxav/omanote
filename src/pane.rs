@@ -378,6 +378,49 @@ mod tests {
         assert_eq!(pane.scrolled(), 0);
     }
 
+    /// Whether scrolling back far enough shows `text`.
+    fn reachable(parser: &mut vt100::Parser, text: &str) -> bool {
+        let found = (0..=200).any(|back| {
+            parser.set_scrollback(back);
+            parser.screen().contents().contains(text)
+        });
+        parser.set_scrollback(0);
+        found
+    }
+
+    #[test]
+    fn history_printed_above_an_input_box_is_kept() {
+        // The way Codex and other agents keep their input box at the bottom:
+        // a scroll region over the rows above it, and the chat printed there.
+        let mut parser = vt100::Parser::new(10, 20, 100);
+        parser.process(b"\x1b[1;7r\x1b[7;1H");
+        for i in 1..=30 {
+            parser.process(format!("\r\nmsg-{i}").as_bytes());
+        }
+        parser.process(b"\x1b[9;1H> typing here");
+        let screen = parser.screen();
+        assert!(!screen.contents().contains("msg-10\n"), "long gone off the top");
+        assert!(screen.contents().contains("> typing here"), "the input box stays put");
+        assert!(reachable(&mut parser, "msg-10"), "and still there to scroll back to");
+        assert!(reachable(&mut parser, "msg-1\n"), "all of it");
+
+        // A region that does not start at the top is an app moving its own
+        // lines about, not history: nothing is added.
+        let mut parser = vt100::Parser::new(10, 20, 100);
+        parser.process(b"\x1b[3;7r\x1b[7;1H");
+        for i in 1..=30 {
+            parser.process(format!("\r\nmsg-{i}").as_bytes());
+        }
+        assert!(!reachable(&mut parser, "msg-10"));
+        // And the alternate screen keeps no history at all, as in any terminal.
+        let mut parser = vt100::Parser::new(10, 20, 100);
+        parser.process(b"\x1b[?1049h");
+        for i in 1..=30 {
+            parser.process(format!("msg-{i}\r\n").as_bytes());
+        }
+        assert!(!reachable(&mut parser, "msg-10"));
+    }
+
     #[test]
     fn resizing_tells_the_program() {
         let mut pane = Pane::spawn("sleep 0.3; stty size", &std::env::temp_dir(), &[], 10, 40).unwrap();

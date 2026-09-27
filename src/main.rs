@@ -1434,7 +1434,8 @@ impl App {
                     Err(e) => self.say(format!("Could not save: {e}")),
                 }
             } else if !same {
-                self.say(said);
+                // The note is on disk already; only the tidying did not happen.
+                self.say(format!("Saved · {said}"));
             }
         } else {
             self.say(said);
