@@ -40,10 +40,15 @@ pub enum El {
     TableHeader,
     Rule,
     Spelling,
+    Comment,
+    Keyword,
+    String,
+    Number,
+    Key,
 }
 
 /// Every element, the name it has in the settings, and what it is.
-pub const ELEMENTS: [(El, &str, &str); 26] = [
+pub const ELEMENTS: [(El, &str, &str); 31] = [
     (El::Text, "text", "ordinary text"),
     (El::H1, "h1", "# heading"),
     (El::H2, "h2", "## heading"),
@@ -70,6 +75,11 @@ pub const ELEMENTS: [(El, &str, &str); 26] = [
     (El::TableHeader, "table.header", "a table's header row"),
     (El::Rule, "rule", "--- a horizontal rule"),
     (El::Spelling, "spelling", "a misspelt word, or a slip of grammar"),
+    (El::Comment, "comment", "a comment, in code or a config file"),
+    (El::Keyword, "keyword", "a language's own words: if, local, fn"),
+    (El::String, "string", "\"quoted text\" in code"),
+    (El::Number, "number", "a number in code"),
+    (El::Key, "key", "the keys of a config file, and of JSON"),
 ];
 
 fn default(el: El) -> Style {
@@ -93,6 +103,12 @@ fn default(el: El) -> Style {
         El::TaskDoneText => Style::new().fg(Color::DarkGray).add_modifier(Modifier::CROSSED_OUT),
         El::Syntax | El::TableBorder | El::Rule => Style::new().fg(Color::DarkGray),
         El::Spelling => Style::new().add_modifier(Modifier::UNDERLINED).underline_color(Color::Red),
+        // Quiet but readable: derived from the terminal's own colours, like the chrome.
+        El::Comment => crate::theme::get().muted().add_modifier(Modifier::ITALIC),
+        El::Keyword => Style::new().fg(Color::Magenta),
+        El::String => Style::new().fg(Color::Yellow),
+        El::Number => Style::new().fg(Color::Cyan),
+        El::Key => Style::new().fg(Color::Blue),
     }
 }
 

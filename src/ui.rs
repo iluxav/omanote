@@ -8,7 +8,7 @@ use ratatui::widgets::{Block, Clear, Paragraph};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::agents::Chooser;
-use crate::commands::{Command, Output, Palette, key_name};
+use crate::commands::{Output, Palette, key_name};
 use crate::config::{Align, Config};
 use crate::editor::{Editor, Pos};
 use crate::find::Find;
@@ -141,7 +141,7 @@ pub struct Scene<'a> {
     pub mention: Option<&'a Mention>,
     pub find: Option<&'a Find>,
     /// Ctrl+R: the list of commands that is open.
-    pub palette: Option<(&'a Palette, &'a [Command])>,
+    pub palette: Option<&'a Palette>,
     /// What the spelling check found in the focused note, and the fix list if it is open.
     pub problems: &'a [Problem],
     pub fixer: Option<&'a Fixer>,
@@ -184,8 +184,8 @@ pub fn draw(f: &mut Frame, ed: &mut Editor, scene: Scene) {
     let area = panes.notes();
     if let Some(chooser) = chooser {
         draw_chooser(f, chooser, area);
-    } else if let Some((palette, commands)) = palette {
-        draw_palette(f, palette, commands, area);
+    } else if let Some(palette) = palette {
+        draw_palette(f, palette, config, area);
     } else if let Some(prompt) = save_as {
         draw_save_as(f, prompt, toast, area);
     } else if let Some(picker) = picker {
@@ -292,7 +292,7 @@ fn draw_note(f: &mut Frame, ed: &mut Editor, area: Rect, config: &Config, place:
                 f.set_cursor_position(xy);
             }
             ed.view.back = draw_status(f, ed, place, focus.toast, focus.sync, focus.back, true, status);
-            draw_hints(f, focus.split, ed.markdown, hints);
+            draw_hints(f, focus.split, ed, config, hints);
         }
         None => {
             ed.view.back = None;
@@ -427,30 +427,48 @@ fn draw_chooser(f: &mut Frame, c: &Chooser, area: Rect) {
 }
 
 /// One row of a popup's list: marker, text, and a quiet note at the right edge.
-/// Ctrl+R: your commands, with the key each has and what it does with its output.
-fn draw_palette(f: &mut Frame, palette: &Palette, commands: &[Command], area: Rect) {
+/// Ctrl+R: your commands, with the key each has and what it does with its
+/// output. Ctrl+Shift+W: your formatters, the kind of file each is for and
+/// what it runs.
+fn draw_palette(f: &mut Frame, palette: &Palette, config: &Config, area: Rect) {
     let look = theme::get();
-    let shown = commands.len().clamp(1, PICKER_ROWS).min(area.height.saturating_sub(6) as usize).max(1);
-    let hints = [("↑↓", "select"), ("Enter", "run"), ("1-9", "pick"), ("Esc", "cancel")];
-    let inner = popup(f, area, "Run", "on the selection, or the paragraph", &hints, shown as u16, 62);
+    let rows: Vec<(String, String)> = if palette.formatters {
+        config.formatters.iter().map(|formatter| (formatter.kind.clone(), formatter.run.clone())).collect()
+    } else {
+        config
+            .commands
+            .iter()
+            .map(|command| {
+                let does = match command.output {
+                    Output::Replace => "replaces",
+                    Output::Insert => "inserts",
+                    Output::Message => "shows",
+                    Output::Whole => "formats",
+                };
+                let note = match command.key {
+                    Some(key) => format!("{does} · {}", key_name(key)),
+                    None => does.to_string(),
+                };
+                (command.name.clone(), note)
+            })
+            .collect()
+    };
+    let shown = rows.len().clamp(1, PICKER_ROWS).min(area.height.saturating_sub(6) as usize).max(1);
+    let (title, note, go) = if palette.formatters { ("Format as", "the whole note goes through it", "format") } else { ("Run", "on the selection, or the paragraph", "run") };
+    let hints = [("↑↓", "select"), ("Enter", go), ("1-9", "pick"), ("Esc", "cancel")];
+    let inner = popup(f, area, title, note, &hints, shown as u16, 62);
     let first = palette.selected.saturating_sub(shown - 1);
-    let lines: Vec<Line> = commands
+    let lines: Vec<Line> = rows
         .iter()
         .enumerate()
         .skip(first)
         .take(shown)
-        .map(|(i, command)| {
+        .map(|(i, (name, note))| {
             let number = if i < 9 { format!("{}  ", i + 1) } else { "   ".to_string() };
-            let does = match command.output {
-                Output::Replace => "replaces",
-                Output::Insert => "inserts",
-                Output::Message => "shows",
-            };
-            let note = match command.key {
-                Some(key) => format!("{does} · {}", key_name(key)),
-                None => does.to_string(),
-            };
-            list_row(i == palette.selected, vec![Span::styled(number, look.muted()), Span::raw(command.name.clone())], note, inner.width)
+            // A long command is cut short rather than pushed off the edge.
+            let room = (inner.width as usize).saturating_sub(3 + number.chars().count() + name.chars().count() + 3);
+            let note = if note.chars().count() > room { format!("{}…", note.chars().take(room.saturating_sub(1)).collect::<String>()) } else { note.clone() };
+            list_row(i == palette.selected, vec![Span::styled(number, look.muted()), Span::raw(name.clone())], note, inner.width)
         })
         .collect();
     f.render_widget(Paragraph::new(lines).style(look.surface()), inner);
@@ -849,8 +867,9 @@ fn draw_status(f: &mut Frame, ed: &Editor, place: &str, toast: Option<&str>, syn
     back_at
 }
 
-fn draw_hints(f: &mut Frame, split: bool, markdown: bool, area: Rect) {
+fn draw_hints(f: &mut Frame, split: bool, ed: &Editor, config: &Config, area: Rect) {
     let look = theme::get();
+    let markdown = ed.markdown;
     // Only what is omanote's own. Copy, paste, undo, bold and the like are the
     // keys they are everywhere, and listing them would crowd these out.
     // Beside another note, ^Q closes this one, and there is somewhere else to go.
@@ -862,6 +881,11 @@ fn draw_hints(f: &mut Frame, split: bool, markdown: bool, area: Rect) {
     }
     if split {
         hints.insert(1, ("F6", "other note"));
+    }
+    // A formatter is worth a hint only where there is one to run.
+    if crate::commands::formatter(&config.formatters, ed.path.as_deref(), markdown).is_some() {
+        let at = hints.iter().position(|h| h.0 == "^S").map_or(hints.len(), |i| i + 1);
+        hints.insert(at, ("^W", "format"));
     }
     // The key carries the weight, the word beside it stays quiet.
     let key = Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD);

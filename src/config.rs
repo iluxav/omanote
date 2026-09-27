@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::commands::Command;
+use crate::commands::{Command, Formatter};
 use crate::look::Look;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,6 +38,8 @@ pub struct Config {
     pub look: Look,
     /// `command.<name> = "..."`: your own commands, for Ctrl+R.
     pub commands: Vec<Command>,
+    /// `format.<kind> = "..."`: what tidies a file, on Ctrl+W and after Ctrl+S.
+    pub formatters: Vec<Formatter>,
     /// Spelling and grammar, checked as you write, and in which English.
     pub spelling: bool,
     pub dialect: String,
@@ -48,7 +50,7 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Config { width: 84, align: Align::Center, margin: 2, assistant: None, agents: Vec::new(), look: Look::default(), commands: Vec::new(), spelling: true, dialect: "american".into(), grammar: Grammar::Auto, complete: Default::default() }
+        Config { width: 84, align: Align::Center, margin: 2, assistant: None, agents: Vec::new(), look: Look::default(), commands: Vec::new(), formatters: Vec::new(), spelling: true, dialect: "american".into(), grammar: Grammar::Auto, complete: Default::default() }
     }
 }
 
@@ -92,7 +94,8 @@ margin = 2
 #
 # Elements: text  h1 h2 h3 h4 h5 h6  bold  italic  strike  highlight  code
 #   codeblock  link  tag  quote  quote.bar  list  task  task.done
-#   task.done.text  syntax  table.border  table.header  rule
+#   task.done.text  syntax  table.border  table.header  rule  spelling
+#   comment  keyword  string  number  key   (code, and config files)
 #
 # editor.style.h1.color = "#ff9e64"
 # editor.style.h1.underline = false
@@ -119,6 +122,24 @@ margin = 2
 # command.Insert date.output = "insert"
 # command.Word count = "wc -w < {file}"
 # command.Word count.output = "message"
+
+# Formatters: a program that reads the whole file on its standard input and
+# prints it back tidied. Ctrl+W runs the one for the file you are in, and
+# Ctrl+S runs it after saving (notes saving themselves as you type does not).
+# Ctrl+Shift+W (or Alt+W) lists them to pick one, for a note that has no file
+# yet. Ctrl+Z undoes it. Name them by the file's extension, or by a language
+# omanote knows: format.sh covers .bashrc and .zsh too.
+#
+#   format.<kind> = "<what to run>"
+#   format.<kind>.save = false         Ctrl+W only, not after Ctrl+S
+#
+# format.md = "prettier --parser markdown"
+# format.lua = "stylua -"
+# format.sh = "shfmt"
+# format.py = "ruff format -"
+# format.rs = "rustfmt"
+# format.go = "gofmt"
+# format.json = "jq ."
 
 # Spelling and grammar are checked as you write, in English, once Shift+F7 has
 # turned it on (the first time, it downloads the 78 MB grammar model). Mistakes
@@ -344,6 +365,11 @@ fn parse(text: &str) -> (Config, Vec<String>) {
                     problems.push(format!("line {}: {problem}", n + 1));
                 }
             }
+            formatter if formatter.starts_with("format.") => {
+                if let Err(problem) = crate::commands::set_formatter(&mut config.formatters, &formatter["format.".len()..], value) {
+                    problems.push(format!("line {}: {problem}", n + 1));
+                }
+            }
             style if style.starts_with("editor.style.") || style.starts_with("style.") => {
                 let element = style.trim_start_matches("editor.").trim_start_matches("style.");
                 if let Err(problem) = config.look.set(element, value) {
@@ -436,6 +462,17 @@ mod tests {
     }
 
     #[test]
+    fn formatters_are_read_by_file_kind() {
+        let (config, problems) = parse("format.lua = \"stylua -\"\nformat.md = \"prettier --parser markdown\"\nformat.md.save = false\nformat.lua.save = maybe\nformat. = \"x\"\nformat.rs.save = false");
+        let lua = Formatter { kind: "lua".into(), run: "stylua -".into(), on_save: true };
+        let md = Formatter { kind: "md".into(), run: "prettier --parser markdown".into(), on_save: false };
+        assert_eq!(config.formatters, [lua, md]);
+        assert_eq!(problems.len(), 3, "{problems:?}");
+        assert!(problems[0].starts_with("line 4:") && problems[2].contains("format.rs runs first"), "{problems:?}");
+        assert!(parse(TEMPLATE).0.formatters.is_empty(), "the template's formatters are examples, commented out");
+    }
+
+    #[test]
     fn type_ahead_is_off_until_a_model_is_named() {
         assert!(!parse(TEMPLATE).0.complete.on());
         let (config, problems) = parse("complete.model = \"qwen3.5:9b\"\ncomplete.url = \"http://box:8080/v1/\"\ncomplete.words = 2\ncomplete.words = 0\ncomplete.url = localhost\ncomplete.context = 4096\ncomplete.context = 10");
@@ -449,7 +486,7 @@ mod tests {
         let old = "# omanote settings.\n\nwidth = 100\n\nalign = \"center\"\n\nmargin = 2\n";
         let grown = with_new_sections(old);
         assert!(grown.starts_with(old.trim_end()), "what was there is untouched");
-        for topic in ["agent.", "editor.style.", "command.", "spelling", "complete."] {
+        for topic in ["agent.", "editor.style.", "command.", "format.", "spelling", "complete."] {
             assert!(grown.contains(topic), "{topic} was added");
         }
         assert_eq!(grown.matches("width = ").count(), 1, "nothing is added twice");

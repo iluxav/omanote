@@ -21,6 +21,7 @@ mod remind;
 mod saveas;
 mod spell;
 mod sync;
+mod syntax;
 mod table;
 mod theme;
 mod ui;
@@ -89,6 +90,8 @@ struct App {
     /// Ctrl+R: the list of your own commands, and the one that is running.
     palette: Option<commands::Palette>,
     running: Option<commands::Running>,
+    /// Ctrl+S started the formatter: what it gives back goes to disk too.
+    format_saves: bool,
     /// Spelling: the checker on its thread, what it found in the note on
     /// screen (and which edit that answers), and the F7 fix list.
     spell: Option<spell::Checker>,
@@ -224,6 +227,49 @@ impl App {
             }
             Ok(false) => self.ask_where(After::Stay),
             Err(e) => self.say(format!("Could not save: {e}")),
+        }
+    }
+
+    /// Ctrl+S: save, then tidy the file with its formatter, if it has one.
+    fn save_and_format(&mut self) {
+        self.save();
+        if !self.ed.dirty && self.ed.path.is_some() {
+            self.format(true);
+        }
+    }
+
+    /// Ctrl+W, or Ctrl+S just done: the file's formatter from the settings
+    /// gets the whole note, and its answer takes the note's place. It runs
+    /// beside the editor like any command; `poll_command` puts the result in.
+    fn format(&mut self, after_save: bool) {
+        let found = commands::formatter(&self.settings.formatters, self.ed.path.as_deref(), self.ed.markdown);
+        let Some(formatter) = found.filter(|f| f.on_save || !after_save).cloned() else {
+            if !after_save {
+                let ext = self.ed.path.as_deref().and_then(|p| p.extension()).map(|e| e.to_string_lossy().to_lowercase());
+                let kind = ext.unwrap_or_else(|| if self.ed.markdown { "md".into() } else { "<kind>".into() });
+                self.say(format!("No formatter for this file: format.{kind} = \"...\" in the settings (omanote --config)"));
+            }
+            return;
+        };
+        self.start_formatter(formatter, after_save);
+    }
+
+    /// Put the whole note through `formatter`, beside the editor like any command.
+    fn start_formatter(&mut self, formatter: commands::Formatter, after_save: bool) {
+        if let Some(running) = &self.running {
+            if !after_save {
+                return self.say(format!("{} is still running · Esc stops it", running.name));
+            }
+            return;
+        }
+        let command = commands::Command { name: "Format".into(), run: formatter.run, output: commands::Output::Whole, key: None };
+        match commands::start(&command, &self.ed, &self.command_dir()) {
+            Ok(running) => {
+                self.mention = None;
+                self.running = Some(running);
+                self.format_saves = after_save;
+            }
+            Err(e) => self.say(e),
         }
     }
 
@@ -1278,28 +1324,52 @@ impl App {
             return self.say("No commands yet. Add yours in the settings (omanote --config): command.Sort lines = \"sort\"");
         }
         self.mention = None;
-        self.palette = Some(commands::Palette { selected: 0 });
+        self.palette = Some(commands::Palette { selected: 0, formatters: false });
+    }
+
+    /// Ctrl+Shift+W: which formatter? For a note that has no file yet, or
+    /// text in a language its name does not say. The file's own, if it has
+    /// one, is offered first.
+    fn open_format_picker(&mut self) {
+        if self.settings.formatters.is_empty() {
+            return self.say("No formatters yet. Add yours in the settings (omanote --config): format.lua = \"stylua -\"");
+        }
+        let own = commands::formatter(&self.settings.formatters, self.ed.path.as_deref(), self.ed.markdown);
+        let selected = own.and_then(|f| self.settings.formatters.iter().position(|g| g.kind == f.kind)).unwrap_or(0);
+        self.mention = None;
+        self.palette = Some(commands::Palette { selected, formatters: true });
     }
 
     fn palette_key(&mut self, key: KeyEvent) {
         let Some(palette) = &mut self.palette else { return };
-        let n = self.settings.commands.len().max(1);
+        let formatters = palette.formatters;
+        let n = if formatters { self.settings.formatters.len() } else { self.settings.commands.len() }.max(1);
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Esc => self.palette = None,
-            KeyCode::Char('c' | 'r') if ctrl => self.palette = None,
+            KeyCode::Char('c' | 'r' | 'w' | 'W') if ctrl => self.palette = None,
             KeyCode::Up | KeyCode::BackTab => palette.selected = (palette.selected + n - 1) % n,
             KeyCode::Down | KeyCode::Tab => palette.selected = (palette.selected + 1) % n,
             KeyCode::Char(c @ '1'..='9') if (c as usize - '1' as usize) < n => {
                 self.palette = None;
-                self.run_command(c as usize - '1' as usize);
+                self.pick(formatters, c as usize - '1' as usize);
             }
             KeyCode::Enter => {
                 let at = palette.selected;
                 self.palette = None;
-                self.run_command(at);
+                self.pick(formatters, at);
             }
             _ => {}
+        }
+    }
+
+    /// The list's choice: a command to run, or a formatter to put the note through.
+    fn pick(&mut self, formatter: bool, at: usize) {
+        if !formatter {
+            return self.run_command(at);
+        }
+        if let Some(formatter) = self.settings.formatters.get(at).cloned() {
+            self.start_formatter(formatter, false);
         }
     }
 
@@ -1316,12 +1386,7 @@ impl App {
                 return self.say(format!("Could not save: {e}"));
             }
         }
-        // In the note's vault, as the assistant is; a loose file's own folder.
-        let all = vaults::all(&vaults::home());
-        let note = self.ed.path.as_ref().map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()));
-        let vault = note.as_ref().and_then(|n| all.iter().map(|v| &v.path).filter(|v| n.starts_with(v)).max_by_key(|v| v.as_os_str().len()).cloned());
-        let dir = vault.or_else(|| note.as_ref().and_then(|n| n.parent().map(PathBuf::from))).or_else(|| all.first().map(|v| v.path.clone())).unwrap_or_else(|| PathBuf::from("."));
-        match commands::start(&command, &self.ed, &dir) {
+        match commands::start(&command, &self.ed, &self.command_dir()) {
             Ok(running) => {
                 self.mention = None;
                 self.running = Some(running);
@@ -1330,17 +1395,47 @@ impl App {
         }
     }
 
+    /// Where a command runs: in the note's vault, as the assistant is; a
+    /// loose file's own folder.
+    fn command_dir(&self) -> PathBuf {
+        let all = vaults::all(&vaults::home());
+        let note = self.ed.path.as_ref().map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()));
+        let vault = note.as_ref().and_then(|n| all.iter().map(|v| &v.path).filter(|v| n.starts_with(v)).max_by_key(|v| v.as_os_str().len()).cloned());
+        vault.or_else(|| note.as_ref().and_then(|n| n.parent().map(PathBuf::from))).or_else(|| all.first().map(|v| v.path.clone())).unwrap_or_else(|| PathBuf::from("."))
+    }
+
     /// Whether a running command is done; true if something changed on screen.
     fn poll_command(&mut self) -> bool {
         let Some(running) = &self.running else { return false };
         let mut spare = None;
-        let commands::Outcome::Said(said) = running.finish(&mut self.ed, &mut spare) else { return false };
+        let edits = self.ed.edits;
+        let (said, same) = match running.finish(&mut self.ed, &mut spare) {
+            commands::Outcome::Waiting => return false,
+            commands::Outcome::Said(said) => (said, false),
+            commands::Outcome::Same(said) => (said, true),
+        };
         self.running = None;
         if let Some(text) = spare {
             clipboard::copy(&text);
             self.ed.clipboard = text;
         }
-        self.say(said);
+        // After Ctrl+S, the tidied note goes to disk as well; with nothing to
+        // tidy, "Saved" stands.
+        if std::mem::take(&mut self.format_saves) {
+            if self.ed.edits != edits {
+                match self.ed.save() {
+                    Ok(_) => {
+                        self.say("Formatted and saved · Ctrl+Z undoes the formatting");
+                        self.settings_saved(false);
+                    }
+                    Err(e) => self.say(format!("Could not save: {e}")),
+                }
+            } else if !same {
+                self.say(said);
+            }
+        } else {
+            self.say(said);
+        }
         true
     }
 
@@ -1547,6 +1642,8 @@ impl App {
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
+            // Ctrl+Shift+W needs a terminal that can tell it from Ctrl+W; Alt+W always works.
+            KeyCode::Char('w' | 'W') if ctrl && shift => self.open_format_picker(),
             KeyCode::Char(c) if ctrl => match c.to_ascii_lowercase() {
                 'q' => self.quit(),
                 'r' => self.open_palette(),
@@ -1558,7 +1655,7 @@ impl App {
                     self.picker = Some(Picker::open_with(&all, std::env::current_dir().ok().as_deref()));
                 }
                 's' if shift => self.relocate(),
-                's' => self.save(),
+                's' => self.save_and_format(),
                 'z' if shift => self.redo(),
                 'z' => {
                     if !ed.undo() {
@@ -1589,11 +1686,13 @@ impl App {
                 'b' => self.wrap("**"),
                 'i' => self.wrap("*"),
                 't' => ed.toggle_task(ed.cursor.row),
-                'h' | 'w' => ed.delete_word_back(),
+                'h' => ed.delete_word_back(),
+                'w' => self.format(false),
                 _ => {}
             },
             // Ctrl+Shift+O needs a terminal that can tell it from Ctrl+O; Alt+O always works.
             KeyCode::Char('o' | 'O') if alt => self.follow(self.ed.cursor, true),
+            KeyCode::Char('w' | 'W') if alt => self.open_format_picker(),
             KeyCode::Char(c) if !alt => ed.insert_char(c),
             // Super+Shift is the natural chord, but most window managers keep Super
             // for themselves, so Alt+Shift does the same thing.
@@ -1950,6 +2049,11 @@ omanote — a small markdown note editor
   Ctrl+R inside the editor    your own commands: command.<name> = \"<anything a shell runs>\"
                               in the settings. The selection (or the paragraph) goes in,
                               what comes out takes its place: grammar, translation, dates
+  Ctrl+W inside the editor    tidy the file with its formatter: format.<kind> = \"<what to run>\"
+                              in the settings, by extension or language (format.lua = \"stylua -\",
+                              format.md = \"prettier --parser markdown\"). Ctrl+S runs it too,
+                              after saving; Ctrl+Z undoes it. Ctrl+Shift+W (or Alt+W) lists
+                              them to pick one: for a note that has no file yet
   @ inside the editor         link a note: type @ and a few letters, pick from the list;
                               a note created there opens beside this one, ready to write
                               (the last entry creates a note by that name), Enter
@@ -2270,6 +2374,7 @@ fn main() -> std::io::Result<()> {
         mention: None,
         palette: None,
         running: None,
+        format_saves: false,
         spell: None,
         grammar: None,
         grammar_backend: None,
@@ -2414,7 +2519,7 @@ fn main() -> std::io::Result<()> {
                     chooser: app.chooser.as_ref(),
                     mention: app.mention.as_ref(),
                     find: app.find.as_ref(),
-                    palette: app.palette.as_ref().map(|p| (p, app.settings.commands.as_slice())),
+                    palette: app.palette.as_ref(),
                     problems: &app.problems,
                     fixer: app.fixer.as_ref(),
                     ghost: ghost.as_deref(),

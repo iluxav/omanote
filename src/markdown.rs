@@ -8,6 +8,7 @@
 use ratatui::style::{Modifier, Style};
 
 use crate::look::{self, El};
+use crate::syntax::{self, Lang, Open};
 use crate::table;
 
 pub const CHECK_OPEN: &str = "\u{f0131}";
@@ -20,11 +21,11 @@ pub enum Block {
     Table { start: usize, end: usize },
     FenceOpen,
     FenceClose,
-    Code,
-    /// A line of a file that is not markdown: shown exactly as it is.
-    Plain,
-    /// The same, for a `# comment` line of a config file: shown quieter.
-    Comment,
+    /// A line of fenced code, coloured for the language the fence names, if any.
+    Code { lang: Option<Lang>, open: Open },
+    /// A line of a file that is not markdown: shown exactly as it is, and
+    /// coloured for its language when omanote knows it.
+    Source { lang: Option<Lang>, open: Open },
 }
 
 #[derive(Clone, Debug, Default)]
@@ -71,22 +72,41 @@ fn fence_char(line: &[char]) -> Option<char> {
     ((c == '`' || c == '~') && run_len(line, i, line.len(), c) >= 3).then_some(c)
 }
 
+/// The language a fence names: ```` ```lua ````, `~~~ toml`, ```` ```rust,ignore ````.
+fn fence_lang(line: &[char]) -> Option<Lang> {
+    let i = indent(line);
+    let from = i + run_len(line, i, line.len(), *line.get(i)?);
+    let info: String = line[from..].iter().collect();
+    let name = info.trim().split(|c: char| c.is_whitespace() || matches!(c, ',' | '{' | ':')).next()?;
+    Lang::named(name)
+}
+
 /// Classify each line as normal text or part of a fenced code block.
 pub fn classify(lines: &[Vec<char>]) -> Vec<Block> {
     let mut out = Vec::with_capacity(lines.len());
     let mut open: Option<char> = None;
+    let mut lang = None;
+    let mut left = Open::No;
     for line in lines {
         let fence = fence_char(line);
         let block = match (open, fence) {
             (None, Some(c)) => {
                 open = Some(c);
+                lang = fence_lang(line);
+                left = Open::No;
                 Block::FenceOpen
             }
             (Some(o), Some(c)) if o == c && line.iter().all(|x| *x == c || x.is_whitespace()) => {
                 open = None;
                 Block::FenceClose
             }
-            (Some(_), _) => Block::Code,
+            (Some(_), _) => {
+                let block = Block::Code { lang, open: left };
+                if let Some(lang) = lang {
+                    left = syntax::carry(line, lang, left);
+                }
+                block
+            }
             (None, None) => Block::Normal,
         };
         out.push(block);
@@ -238,23 +258,13 @@ pub fn style_line(chars: &[char], block: Block) -> StyledLine {
     };
 
     match block {
-        Block::Plain => {
-            for cell in &mut sl.cells {
-                cell.style = look::of(El::Text);
-            }
+        Block::Source { lang, open } => {
+            paint(chars, lang, open, look::of(El::Text), &mut sl.cells);
             return sl;
         }
-        Block::Comment => {
-            for cell in &mut sl.cells {
-                cell.style = crate::theme::get().muted();
-            }
-            return sl;
-        }
-        Block::Code => {
+        Block::Code { lang, open } => {
             sl.prefix = Some(("│ ", marker()));
-            for cell in &mut sl.cells {
-                cell.style = look::of(El::CodeBlock);
-            }
+            paint(chars, lang, open, look::of(El::CodeBlock), &mut sl.cells);
             return sl;
         }
         Block::FenceOpen | Block::FenceClose => {
@@ -346,6 +356,16 @@ pub fn style_line(chars: &[char], block: Block) -> StyledLine {
         }
     }
     sl
+}
+
+/// Code, plain or coloured: `base` everywhere, the language's tokens over it.
+fn paint(chars: &[char], lang: Option<Lang>, open: Open, base: Style, cells: &mut [CharCell]) {
+    for cell in cells.iter_mut() {
+        cell.style = base;
+    }
+    if let Some(lang) = lang {
+        syntax::paint(chars, lang, open, base, cells);
+    }
 }
 
 fn hide(cells: &mut [CharCell], k: usize) {
@@ -674,11 +694,31 @@ mod tests {
 
     #[test]
     fn fences() {
-        let lines: Vec<Vec<char>> = ["a", "```rs", "**x**", "```", "b"].iter().map(|s| s.chars().collect()).collect();
+        let to_lines = |src: &[&str]| src.iter().map(|s| s.chars().collect()).collect::<Vec<Vec<char>>>();
+        let rust = |open| Block::Code { lang: Some(Lang::Rust), open };
         assert_eq!(
-            classify(&lines),
-            [Block::Normal, Block::FenceOpen, Block::Code, Block::FenceClose, Block::Normal]
+            classify(&to_lines(&["a", "```rs", "let x = /* c", "d */ 1;", "```", "b"])),
+            [Block::Normal, Block::FenceOpen, rust(Open::No), rust(Open::Comment("*/")), Block::FenceClose, Block::Normal],
+            "the fence names the language, and a comment left open carries to the next line"
         );
+        let plain = Block::Code { lang: None, open: Open::No };
+        assert_eq!(classify(&to_lines(&["```", "**x**", "```"])), [Block::FenceOpen, plain, Block::FenceClose]);
+        assert_eq!(classify(&to_lines(&["~~~ text", "x", "~~~"]))[1], plain, "a language omanote does not know");
+        assert_eq!(classify(&to_lines(&["```lua", "x", "```", "```rust,ignore", "y", "```"]))[4], rust(Open::No), "the next fence starts afresh");
+    }
+
+    #[test]
+    fn colours_fenced_code() {
+        let chars: Vec<char> = "local x = 1".chars().collect();
+        let sl = style_line(&chars, Block::Code { lang: Some(Lang::Lua), open: Open::No });
+        let base = look::of(El::CodeBlock);
+        assert_eq!(sl.prefix.map(|p| p.0), Some("│ "));
+        assert_eq!(sl.cells[0].style, base.patch(look::of(El::Keyword)));
+        assert_eq!(sl.cells[6].style, base, "the block's own colour shows between tokens");
+        assert_eq!(sl.cells[10].style, base.patch(look::of(El::Number)));
+        assert!(sl.cells.iter().all(|c| !c.hidden && c.repl.is_none()), "nothing is concealed in code");
+        let sl = style_line(&chars, Block::Code { lang: None, open: Open::No });
+        assert!(sl.cells.iter().all(|c| c.style == base));
     }
     #[test]
     fn finds_the_link_under_the_cursor() {

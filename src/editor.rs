@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use crate::images::Images;
 use crate::layout::{VRow, layout, locate};
 use crate::markdown::{Block, LinkTo, classify, continuation, data_definition, definition, link_at, task_mark};
+use crate::syntax::{self, Lang};
 use crate::table::{self, Role};
 
 const UNDO_LIMIT: usize = 500;
@@ -100,17 +101,6 @@ pub fn is_markdown(path: Option<&std::path::Path>) -> bool {
     }
 }
 
-/// File types where a leading `#` starts a comment, worth showing quieter.
-fn has_hash_comments(path: Option<&std::path::Path>) -> bool {
-    let ext = path.and_then(|p| p.extension()).map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-    ["toml", "conf", "ini", "yaml", "yml", "sh", "env", "cfg"].contains(&ext.as_str())
-}
-
-fn plain_blocks(lines: &[Vec<char>], comments: bool) -> Vec<Block> {
-    let comment = |l: &Vec<char>| comments && l.iter().find(|c| !c.is_whitespace()) == Some(&'#');
-    lines.iter().map(|l| if comment(l) { Block::Comment } else { Block::Plain }).collect()
-}
-
 fn is_word(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
@@ -137,8 +127,7 @@ impl Editor {
             lines.push(Vec::new());
         }
         let markdown = is_markdown(path.as_deref());
-        let comments = has_hash_comments(path.as_deref());
-        let blocks = if markdown { classify(&lines) } else { plain_blocks(&lines, comments) };
+        let blocks = if markdown { classify(&lines) } else { syntax::blocks(&lines, Lang::of_path(path.as_deref())) };
         let mut editor = Editor {
             lines,
             blocks,
@@ -211,7 +200,7 @@ impl Editor {
     }
 
     fn classified(&self) -> Vec<Block> {
-        if self.markdown { classify(&self.lines) } else { plain_blocks(&self.lines, has_hash_comments(self.path.as_deref())) }
+        if self.markdown { classify(&self.lines) } else { syntax::blocks(&self.lines, Lang::of_path(self.path.as_deref())) }
     }
 
     /// The note was given a (different) file: it is markdown or not by its new name.
@@ -276,7 +265,7 @@ impl Editor {
     /// The link at `pos`, with a `[text][label]` reference already looked up.
     /// Code and plain text have no links.
     pub fn link_at(&self, pos: Pos) -> Option<LinkTo> {
-        if !self.markdown || matches!(self.blocks.get(pos.row)?, Block::Code | Block::FenceOpen | Block::FenceClose | Block::Plain | Block::Comment) {
+        if !self.markdown || matches!(self.blocks.get(pos.row)?, Block::Code { .. } | Block::FenceOpen | Block::FenceClose | Block::Source { .. }) {
             return None;
         }
         match link_at(self.lines.get(pos.row)?, pos.col)? {
@@ -761,6 +750,23 @@ impl Editor {
         self.remove_selection();
         self.insert_raw(&text.replace("\r\n", "\n").replace('\r', "\n"));
         self.edited(Edit::Other);
+    }
+
+    /// The whole text replaced, as by a formatter: one undo step, and the
+    /// cursor and the view stay where they were, as far as the new text allows.
+    pub fn replace_all(&mut self, text: &str) {
+        self.checkpoint(Edit::Other);
+        let (cursor, top) = (self.cursor, self.top);
+        self.lines = text.split('\n').map(|l| l.trim_end_matches('\r').chars().collect()).collect();
+        if self.lines.is_empty() {
+            self.lines.push(Vec::new());
+        }
+        let row = cursor.row.min(self.lines.len() - 1);
+        self.cursor = Pos { row, col: cursor.col.min(self.lines[row].len()) };
+        self.anchor = None;
+        self.top = top.min(self.lines.len() - 1);
+        self.edited(Edit::Other);
+        self.last_edit = None;
     }
 
     fn erase(&mut self, target: Pos) {
@@ -1512,8 +1518,9 @@ mod tests {
         let toml = "# settings\nwidth = 84   # **not bold**\n- [ ] not a task\n| a | b |\n|---|---|\n[img1]: data:image/png;base64,AAAA\n";
         let mut e = Editor::new(toml, Some("/tmp/config.toml".into()));
         assert!(!e.markdown);
-        assert_eq!(e.blocks[..2], [Block::Comment, Block::Plain]);
-        assert!(e.blocks[2..].iter().all(|b| *b == Block::Plain), "no tables, no tasks");
+        assert!(e.blocks.iter().all(|b| matches!(b, Block::Source { lang: Some(Lang::Toml), .. })), "no tables, no tasks");
+        let comment = crate::look::of(crate::look::El::Comment);
+        assert!(e.rows(0, false)[0].cells.iter().all(|c| c.style == comment), "the comment line is coloured as one");
         assert_eq!(e.text(), toml, "every line survives, including one that looks like an embedded image");
         // Nothing is hidden or replaced, whether the cursor is on the line or not.
         let shown: String = e.rows(1, false)[0].cells.iter().map(|c| c.text.as_str()).collect();
@@ -1536,7 +1543,7 @@ mod tests {
         let mut e = ed("# Title");
         e.path = Some("/tmp/title.txt".into());
         e.renamed();
-        assert!(!e.markdown && e.blocks == [Block::Plain]);
+        assert!(!e.markdown && e.blocks == [Block::Source { lang: None, open: syntax::Open::No }]);
     }
 
     #[test]

@@ -58,6 +58,7 @@ Write first, name it later: on a new note `Ctrl+S` asks where to keep it (a vaul
 | `Ctrl+F`, `F3` | find in the note, find the next one |
 | `F7` / `Shift+F7` | next spelling or grammar problem, with its fixes / checking off and on |
 | `Ctrl+R` | run one of your own commands on the selection |
+| `Ctrl+W` / `Ctrl+Shift+W` | tidy the file with its formatter (`Ctrl+S` runs it too, after saving) / pick which formatter |
 | `F2` | move, rename or copy the note: another vault, another folder, another name |
 | `@` | link another note: suggestions as you type, or create one |
 | `Ctrl+K` | make the selected text a link |
@@ -207,6 +208,21 @@ A command runs beside the editor, which stays usable: the status line shows `Run
 
 Anything that reads text and prints text fits: `llm`, `claude -p`, `codex exec`, `pandoc`, `sort`, `fmt`, `jq`, a translation script, your own Python. For example `command.Sort lines = "sort"`, `command.To English = "llm 'Translate to English. Reply with the translation only.'"`, `command.Publish = "pandoc {file} -o ~/site/{name}.html"` with `output = "message"`.
 
+### Formatting
+
+A formatter is a program that reads the whole file on its standard input and prints it back tidied. Name one for each kind of file in the settings, by the file's extension or by a language omanote knows:
+
+```toml
+format.md = "prettier --parser markdown"
+format.lua = "stylua -"
+format.sh = "shfmt"          # any shell file: .bashrc and .zsh too
+format.py = "ruff format -"
+format.rs = "rustfmt"
+format.json = "jq ."
+```
+
+`Ctrl+W` runs the one for the file you are in, and `Ctrl+S` runs it after saving and writes the result; `Ctrl+Z` undoes it. `Ctrl+Shift+W` (or `Alt+W`, in a terminal that cannot tell `Ctrl+Shift+W` from `Ctrl+W`) lists the formatters to pick one: for a note that has no file yet, or text in a language its name does not say. Notes save themselves as you type, and that never formats: only `Ctrl+S` does, and `format.md.save = false` keeps a formatter to `Ctrl+W` alone. A formatter runs beside the editor like a command: the cursor stays where it was, one that fails or prints nothing changes nothing and says why, and if you typed while it ran the note is left alone. `{file}` is the note's path, for a formatter that picks its rules from the file name (`prettier --stdin-filepath {file}`).
+
 ### Tables
 
 Type a header row such as `| Item | Price |` and press `Enter`; the rest of the table is created for you.
@@ -311,7 +327,7 @@ editor.style.task.done.text.strike = false
 
 | | |
 | --- | --- |
-| elements | `text` `h1`–`h6` `bold` `italic` `strike` `highlight` `code` `codeblock` `link` `tag` `quote` `quote.bar` `list` `task` `task.done` `task.done.text` `syntax` `table.border` `table.header` `rule` |
+| elements | `text` `h1`–`h6` `bold` `italic` `strike` `highlight` `code` `codeblock` `link` `tag` `quote` `quote.bar` `list` `task` `task.done` `task.done.text` `syntax` `table.border` `table.header` `rule` `spelling` `comment` `keyword` `string` `number` `key` |
 | `color`, `background` | a name (`red`, `bright-blue`, `gray`, `default`), `"#rrggbb"`, or a number from 0 to 255. Names follow your terminal's theme; hex colours do not |
 | `bold` `italic` `underline` `dim` `strike` | `true` or `false` |
 
@@ -321,7 +337,9 @@ Saving applies the settings straight away, with no restart. A line that makes no
 
 ### Files that are not markdown
 
-Markdown rendering is for new notes and `.md` / `.markdown` files. Anything else, such as the settings file, a script or a log, opens as plain text: nothing is hidden or restyled, tables and lists are not touched, and `Enter` just keeps the indentation. Comment lines in config files (`.toml`, `.conf`, `.yaml`, `.sh`, …) are shown quieter.
+Markdown rendering is for new notes and `.md` / `.markdown` files. Anything else, such as the settings file, a script or a log, opens as plain text: nothing is hidden, tables and lists are not touched, and `Enter` just keeps the indentation.
+
+Files whose language omanote knows are coloured: comments, strings, numbers, keywords, and the keys and `[sections]` of config files. That is TOML, YAML, JSON, INI-style files (`.conf`, `.ini`, `.desktop`, `.service`, `.env`), Lua, shell scripts (and `.bashrc`, `Makefile`, `Dockerfile`), Python, Rust, JavaScript and TypeScript, Go, and C. Fenced code in a note is coloured the same way when the fence names its language, as in ```` ```lua ````. The colours are the `comment`, `keyword`, `string`, `number` and `key` elements above.
 
 ## Vaults
 

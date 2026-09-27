@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::editor::{Editor, Pos};
+use crate::syntax::Lang;
 
 /// A command that says nothing for this long is stopped.
 const TIMEOUT: Duration = Duration::from_secs(180);
@@ -37,6 +38,9 @@ pub enum Output {
     Insert,
     /// Nothing in the note changes: the first line that comes out is shown.
     Message,
+    /// The whole note goes in and what comes out takes its place, the cursor
+    /// staying where it was: a formatter.
+    Whole,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -75,6 +79,7 @@ pub fn parse_key(text: &str) -> Result<(KeyCode, KeyModifiers), String> {
         (KeyCode::F(6), m) if m.is_empty() => taken("the other note"),
         (KeyCode::F(7), m) if m.is_empty() || m == KeyModifiers::SHIFT => taken("spelling"),
         (KeyCode::Char('o'), KeyModifiers::ALT) => taken("open the link beside this note"),
+        (KeyCode::Char('w'), KeyModifiers::ALT) => taken("pick a formatter"),
         (KeyCode::Char(_), m) if !m.contains(KeyModifiers::ALT) => Err(format!("{text} is the editor's own, or just a letter: a command's key is F1 to F12, or has alt in it (alt+g)")),
         found => Ok(found),
     }
@@ -147,9 +152,66 @@ pub fn set(commands: &mut Vec<Command>, key: &str, value: &str) -> Result<(), St
     }
 }
 
-/// Ctrl+R: which command?
+/// `format.<kind> = "..."`: a program that reads a file on its standard input
+/// and prints it back tidied. `kind` is a file extension (`lua`, `md`) or the
+/// name of a language omanote knows, so `sh` also covers `.bashrc`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Formatter {
+    pub kind: String,
+    pub run: String,
+    /// After Ctrl+S too, not only on Ctrl+W.
+    pub on_save: bool,
+}
+
+/// One line of the settings: `key` is what follows `format.`: `lua`, or `lua.save`.
+pub fn set_formatter(formatters: &mut Vec<Formatter>, key: &str, value: &str) -> Result<(), String> {
+    let (kind, property) = match key.rsplit_once('.') {
+        Some((kind, p)) if p.trim().eq_ignore_ascii_case("save") => (kind, "save"),
+        _ => (key, ""),
+    };
+    let kind = kind.trim().trim_start_matches('.').to_lowercase();
+    if kind.is_empty() || kind.contains(char::is_whitespace) {
+        return Err("the formatter needs a file kind: format.<extension> = \"<what to run>\", as in format.lua".into());
+    }
+    let at = formatters.iter().position(|f| f.kind == kind);
+    match (property, at) {
+        ("", _) if value.is_empty() => Err(format!("format.{kind} needs something to run")),
+        ("", Some(at)) => {
+            formatters[at].run = value.to_string();
+            Ok(())
+        }
+        ("", None) => {
+            formatters.push(Formatter { kind, run: value.to_string(), on_save: true });
+            Ok(())
+        }
+        (_, None) => Err(format!("say what format.{kind} runs first: format.{kind} = \"...\"")),
+        (_, Some(at)) => {
+            formatters[at].on_save = match value.to_lowercase().as_str() {
+                "true" | "on" | "yes" => true,
+                "false" | "off" | "no" => false,
+                other => return Err(format!("format.{kind}.save is true or false, not `{other}`")),
+            };
+            Ok(())
+        }
+    }
+}
+
+/// The formatter for a file: the one named by its extension, else the one
+/// for its language. A note is markdown, `md`, whatever it is called.
+pub fn formatter<'a>(formatters: &'a [Formatter], path: Option<&Path>, markdown: bool) -> Option<&'a Formatter> {
+    let ext = path.and_then(|p| p.extension()).map(|e| e.to_string_lossy().to_lowercase());
+    let lang = Lang::of_path(path);
+    let by_extension = formatters.iter().find(|f| Some(&f.kind) == ext.as_ref());
+    by_extension.or_else(|| {
+        formatters.iter().find(|f| (markdown && matches!(f.kind.as_str(), "md" | "markdown")) || (lang.is_some() && Lang::named(&f.kind) == lang))
+    })
+}
+
+/// Ctrl+R: which command? Ctrl+Shift+W: which formatter?
 pub struct Palette {
     pub selected: usize,
+    /// The formatters are listed, not the commands.
+    pub formatters: bool,
 }
 
 /// The paragraph around `row`: the lines up and down to the nearest blank ones.
@@ -202,6 +264,8 @@ pub enum Outcome {
     /// Still going.
     Waiting,
     Said(String),
+    /// Over, and it gave back the very text it was given.
+    Same(String),
 }
 
 fn shell() -> String {
@@ -212,11 +276,17 @@ fn shell() -> String {
 /// what it says is applied when it is done, by `Running::finish`.
 pub fn start(command: &Command, ed: &Editor, dir: &Path) -> Result<Running, String> {
     let selection = ed.selection();
+    let whole = command.output == Output::Whole;
     let range = match command.output {
         Output::Replace => Some(selection.or_else(|| paragraph(&ed.lines, ed.cursor.row)).ok_or("Select some text, or put the cursor in a paragraph")?),
+        Output::Whole => Some((Pos::default(), Pos { row: ed.lines.len() - 1, col: ed.lines[ed.lines.len() - 1].len() })),
         _ => selection,
     };
     let given = range.map(|(from, to)| text_of(&ed.lines, from, to)).unwrap_or_default();
+    // A formatter gets the file as it is on disk, final line break and all;
+    // the whole note is too big for an environment variable, and is not a selection.
+    let input = if whole { format!("{given}\n") } else { given.clone() };
+    let selected = if whole { String::new() } else { given.clone() };
 
     let file = ed.path.as_ref().map(|p| std::path::absolute(p).unwrap_or_else(|_| p.clone()));
     let text = |p: Option<&Path>| p.map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
@@ -237,7 +307,7 @@ pub fn start(command: &Command, ed: &Editor, dir: &Path) -> Result<Running, Stri
         .env("OMANOTE_DIR", text(Some(dir)))
         .env("OMANOTE_NAME", name)
         .env("OMANOTE_LINE", (ed.cursor.row + 1).to_string())
-        .env("OMANOTE_SELECTION", &given)
+        .env("OMANOTE_SELECTION", &selected)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -249,7 +319,6 @@ pub fn start(command: &Command, ed: &Editor, dir: &Path) -> Result<Running, Stri
     let pid = child.id();
     let (tx, done) = channel();
     let (mut stdin, stdout, stderr) = (child.stdin.take(), child.stdout.take(), child.stderr.take());
-    let input = given.clone();
     // Fed from a thread of its own: a command that talks before it has
     // finished listening would otherwise leave both sides waiting.
     std::thread::spawn(move || {
@@ -319,16 +388,24 @@ impl Running {
         if said.trim().is_empty() {
             return Outcome::Said(format!("{} said nothing, so nothing was changed", self.name));
         }
-        let still_there = self.range.is_none_or(|(from, to)| from.row < ed.lines.len() && text_of(&ed.lines, from, to) == self.given);
+        // A formatter's answer stands for the whole note, so the whole note
+        // must be as it was: a word typed after the end would otherwise go.
+        let end = Pos { row: ed.lines.len() - 1, col: ed.lines[ed.lines.len() - 1].len() };
+        let still_there = match self.output {
+            Output::Whole => text_of(&ed.lines, Pos::default(), end) == self.given,
+            _ => self.range.is_none_or(|(from, to)| from.row < ed.lines.len() && text_of(&ed.lines, from, to) == self.given),
+        };
+        if !still_there && self.output == Output::Whole {
+            return Outcome::Said(format!("The note changed while {} ran, so it was left alone", self.name));
+        }
         if !still_there {
             *spare = Some(said);
             return Outcome::Said(format!("The text changed while {} ran: its result is in the clipboard (Ctrl+V)", self.name));
         }
         match (self.output, self.range) {
+            (Output::Replace | Output::Whole, _) if said == self.given => return Outcome::Same(format!("{}: nothing to change", self.name)),
+            (Output::Whole, _) => ed.replace_all(&said),
             (Output::Replace, Some((from, to))) => {
-                if said == self.given {
-                    return Outcome::Said(format!("{}: nothing to change", self.name));
-                }
                 ed.move_to(from, false);
                 ed.move_to(to, true);
                 ed.insert_str(&said);
@@ -354,15 +431,22 @@ mod tests {
         Command { name: "Test".into(), run: run.into(), output, key: None }
     }
 
-    fn wait(running: &Running, ed: &mut Editor) -> (String, Option<String>) {
+    fn wait_for(running: &Running, ed: &mut Editor) -> (Outcome, Option<String>) {
         let mut spare = None;
         for _ in 0..600 {
-            if let Outcome::Said(said) = running.finish(ed, &mut spare) {
-                return (said, spare);
+            match running.finish(ed, &mut spare) {
+                Outcome::Waiting => std::thread::sleep(Duration::from_millis(10)),
+                over => return (over, spare),
             }
-            std::thread::sleep(Duration::from_millis(10));
         }
         panic!("the command never finished");
+    }
+
+    fn wait(running: &Running, ed: &mut Editor) -> (String, Option<String>) {
+        match wait_for(running, ed) {
+            (Outcome::Said(said) | Outcome::Same(said), spare) => (said, spare),
+            (Outcome::Waiting, _) => unreachable!(),
+        }
     }
 
     #[test]
@@ -384,6 +468,7 @@ mod tests {
         assert!(said(&mut all, "Fix grammar.output", "sideways").contains("\"replace\", \"insert\" or \"message\""));
         assert!(said(&mut all, "Insert date.key", "f5").contains("already runs Fix grammar"));
         assert!(said(&mut all, "Insert date.key", "F2").contains("already move"));
+        assert!(said(&mut all, "Insert date.key", "alt+w").contains("already pick a formatter"));
         assert!(said(&mut all, "Insert date.key", "ctrl+s").contains("has alt in it"));
         assert!(said(&mut all, "Insert date.key", "g").contains("has alt in it"));
         assert!(said(&mut all, "Insert date.key", "F13").contains("F1 to F12"));
@@ -394,6 +479,62 @@ mod tests {
         assert_eq!(bound(&all, &press(KeyCode::F(5), KeyModifiers::NONE)), Some(0));
         assert_eq!(bound(&all, &press(KeyCode::Char('D'), KeyModifiers::ALT)), Some(1), "capitals or not");
         assert_eq!(bound(&all, &press(KeyCode::Char('d'), KeyModifiers::NONE)), None);
+    }
+
+    #[test]
+    fn formatters_are_read_and_found_by_file_kind() {
+        let mut all = Vec::new();
+        set_formatter(&mut all, "lua", "stylua -").unwrap();
+        set_formatter(&mut all, "Lua.save", "false").unwrap();
+        set_formatter(&mut all, "sh", "shfmt").unwrap();
+        set_formatter(&mut all, "md", "prettier --parser markdown").unwrap();
+        assert_eq!(all[0], Formatter { kind: "lua".into(), run: "stylua -".into(), on_save: false });
+        assert!(all[1].on_save, "on Ctrl+S unless told otherwise");
+        set_formatter(&mut all, "lua", "stylua --indent-type Spaces -").unwrap();
+        assert_eq!((all.len(), all[0].run.as_str(), all[0].on_save), (3, "stylua --indent-type Spaces -", false), "said again: it replaces, the rest kept");
+        let said = |all: &mut Vec<Formatter>, key: &str, value: &str| set_formatter(all, key, value).unwrap_err();
+        assert!(said(&mut all, "py.save", "false").contains("say what format.py runs first"));
+        assert!(said(&mut all, "lua.save", "maybe").contains("true or false"));
+        assert!(said(&mut all, "", "x").contains("needs a file kind") && said(&mut all, "lua", "").contains("something to run"));
+
+        let by = |path: &str| formatter(&all, Some(Path::new(path)), crate::editor::is_markdown(Some(Path::new(path)))).map(|f| f.kind.as_str());
+        assert_eq!(by("/v/init.lua"), Some("lua"));
+        assert_eq!(by("/home/me/.bashrc"), Some("sh"), "by language when the name says it");
+        assert_eq!(by("/v/run.zsh"), Some("sh"));
+        assert_eq!(by("/v/notes/trip.md"), Some("md"));
+        assert_eq!(by("/v/notes/trip.markdown"), Some("md"));
+        assert_eq!(by("/v/x.toml"), None);
+        assert_eq!(formatter(&all, None, true).map(|f| f.kind.as_str()), Some("md"), "a new note is markdown");
+    }
+
+    #[test]
+    fn a_formatter_gets_the_whole_note_and_keeps_the_cursor() {
+        let mut ed = Editor::new("b\n\na\nc", Some("/tmp/list.txt".into()));
+        ed.move_to(Pos { row: 3, col: 1 }, false);
+        let running = start(&command("sort", Output::Whole), &ed, Path::new("/")).unwrap();
+        assert!(wait(&running, &mut ed).0.contains("done"));
+        assert_eq!(ed.text(), "\na\nb\nc\n");
+        assert_eq!((ed.cursor, ed.selection()), (Pos { row: 3, col: 1 }, None), "the cursor stays put");
+        assert!(ed.undo());
+        assert_eq!(ed.text(), "b\n\na\nc\n", "one undo");
+
+        // The file goes in as it is on disk, with its final line break.
+        let running = start(&command("tail -c 1 | od -An -tx1 | tr -d ' \\n'", Output::Whole), &ed, Path::new("/")).unwrap();
+        wait(&running, &mut ed);
+        assert_eq!(ed.text(), "0a\n");
+        ed.undo();
+
+        let running = start(&command("cat", Output::Whole), &ed, Path::new("/")).unwrap();
+        assert!(matches!(wait_for(&running, &mut ed).0, Outcome::Same(_)), "the same text back is not a change");
+        assert!(!ed.undo(), "and leaves nothing to undo");
+
+        // Typing while it runs, even after the end: the note is left alone, and the clipboard too.
+        let running = start(&command("sleep 0.3; echo late", Output::Whole), &ed, Path::new("/")).unwrap();
+        ed.move_to(Pos { row: 3, col: 1 }, false);
+        ed.insert_str("zz");
+        let (said, spare) = wait(&running, &mut ed);
+        assert!(said.contains("left alone"), "{said}");
+        assert_eq!((ed.text().as_str(), spare), ("b\n\na\nczz\n", None));
     }
 
     #[test]
