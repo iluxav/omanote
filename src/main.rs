@@ -17,6 +17,7 @@ mod mention;
 mod now;
 mod pane;
 mod picker;
+mod recent;
 mod remind;
 mod saveas;
 mod spell;
@@ -662,6 +663,7 @@ impl App {
         self.note_saves();
         self.sync.flush();
         self.sync.opened(&path, &vaults::all(&vaults::home()));
+        recent::opened(&vaults::home(), &path);
         self.ed = self.editor(&text, Some(path));
         self.seen_saves = 0;
         self.mention = None;
@@ -733,6 +735,7 @@ impl App {
         self.other = Some(Parked { ed: left, history: std::mem::take(&mut self.history), forward: std::mem::take(&mut self.forward), seen_saves: self.seen_saves });
         self.on_right = true;
         self.sync.opened(&path, &vaults::all(&vaults::home()));
+        recent::opened(&vaults::home(), &path);
         self.ed = self.editor(&text, Some(path));
         self.seen_saves = 0;
         self.mention = None;
@@ -1652,7 +1655,7 @@ impl App {
                 'p' => {
                     let all = vaults::all(&vaults::home());
                     self.sync.pull_all(&all);
-                    self.picker = Some(Picker::open_with(&all, std::env::current_dir().ok().as_deref()));
+                    self.picker = Some(Picker::open_with(&all, std::env::current_dir().ok().as_deref()).with_recent(&recent::list(&vaults::home())));
                 }
                 's' if shift => self.relocate(),
                 's' => self.save_and_format(),
@@ -2030,7 +2033,8 @@ omanote — a small markdown note editor
   omanote <note> --agent      …with the AI agent menu open (--agent=codex: that agent)
   omanote --demo              a note that shows off what the editor renders
   Ctrl+N inside the editor    start a new note (asks to save an unnamed one first)
-  Ctrl+P inside the editor    fuzzy-find a note in any vault; start with > to search inside
+  Ctrl+P inside the editor    fuzzy-find a note in any vault, or a file opened lately (config
+                              files too: ~/.omanote/recent.txt); start with > to search inside
                               the notes instead (>kyoto rail), Enter opens it on that line
   F2 inside the editor        move, rename or copy the note (another vault, another folder)
   Ctrl+F inside the editor    find in the note: matches light up as you type, Enter or
@@ -2296,7 +2300,7 @@ fn main() -> std::io::Result<()> {
         Target::Find(name) => {
             let all = vaults::all(&vaults::home());
             let look = |all: &[vaults::Vault]| {
-                let mut found = Picker::open_with(all, here.as_deref());
+                let mut found = Picker::open_with(all, here.as_deref()).with_recent(&recent::list(&vaults::home()));
                 found.push(&name);
                 found
             };
@@ -2414,6 +2418,9 @@ fn main() -> std::io::Result<()> {
     // Freshen every GitHub vault as we start, in the background, so a note made
     // elsewhere is here by the time it is looked for.
     app.sync.pull_all(&vaults::all(&vaults::home()));
+    if let Some(path) = path.as_deref().filter(|p| p.exists()) {
+        recent::opened(&vaults::home(), path);
+    }
     app.ed = app.editor(&text, path);
     if let Some((line, word)) = &land {
         app.land_at(*line, word);

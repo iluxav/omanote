@@ -137,6 +137,26 @@ impl Picker {
         picker
     }
 
+    /// Files opened lately outside the vaults (config files, scripts),
+    /// listed by where they are: `~/.config/hypr/hyprland.lua`. Newest first
+    /// by when they were last opened or changed, among the notes.
+    pub fn with_recent(mut self, recent: &[(PathBuf, SystemTime)]) -> Self {
+        let listed: std::collections::HashSet<PathBuf> = self.notes.iter().map(|n| n.path.canonicalize().unwrap_or_else(|_| n.path.clone())).collect();
+        for (path, opened) in recent {
+            if listed.contains(path) || self.roots.iter().any(|r| path.starts_with(r)) {
+                continue;
+            }
+            let name: Vec<char> = tilde(path).chars().collect();
+            let lower = name.iter().flat_map(|c| c.to_lowercase()).collect();
+            let changed = std::fs::metadata(path).and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH);
+            self.notes.push(Note { path: path.clone(), name, lower, modified: changed.max(*opened) });
+        }
+        self.notes.sort_by(|a, b| b.modified.cmp(&a.modified).then_with(|| a.name.cmp(&b.name)));
+        self.texts = None;
+        self.refresh();
+        self
+    }
+
     /// `>words`: the query is for what the notes say, not what they are called.
     pub fn in_contents(&self) -> Option<&str> {
         self.query.strip_prefix('>').map(str::trim)
@@ -899,4 +919,26 @@ mod tests {
         assert_eq!(around_match("see [the plan](trips/japan.md)", "japan"), (String::new(), String::new(), "see the plan".into()));
     }
 
+
+    #[test]
+    fn files_opened_elsewhere_are_found_by_name_and_path() {
+        let root = std::env::temp_dir().join(format!("omanote-picker-recent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("vault")).unwrap();
+        std::fs::create_dir_all(root.join("config/hypr")).unwrap();
+        std::fs::write(root.join("vault/ideas.md"), "x").unwrap();
+        let (hypr, note) = (root.join("config/hypr/hyprland.lua"), root.join("vault/ideas.md"));
+        std::fs::write(&hypr, "x").unwrap();
+        let recent = vec![(hypr.clone(), SystemTime::now()), (note.clone(), SystemTime::now())];
+        let mut p = Picker::open(&[Vault { path: root.join("vault"), github: None }]).with_recent(&recent);
+        assert_eq!(p.total(), 2, "a vault note opened lately is not listed twice");
+        p.set_query("hyprland");
+        assert_eq!(p.chosen(), Some(hypr.clone()));
+        assert_eq!(p.resolve(), Resolution::Open(hypr.clone()), "omanote hyprland opens it");
+        p.set_query("hypr lua");
+        assert_eq!(p.chosen(), Some(hypr.clone()), "the folders and the extension count too");
+        p.set_query("");
+        assert_eq!(p.chosen(), Some(hypr), "opened just now: at the top");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

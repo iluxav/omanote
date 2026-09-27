@@ -46,7 +46,9 @@ omanote notes/idea.md   # open that file, or start it if it does not exist
 omanote --demo          # a note that shows everything off
 ```
 
-`omanote <name>` looks in the current folder and in every vault. Case and the `.md` do not matter, so `omanote readme` opens `README.md` and `omanote my ideas` opens `My Ideas.md`. One match opens straight away; with several you get the list (`Tab` to move, `Enter` to open); with none you get a new note, and `Ctrl+S` offers to save it under that name.
+`omanote <name>` looks in the current folder, in every vault, and in the files you have opened lately. Case and the `.md` do not matter, so `omanote readme` opens `README.md` and `omanote my ideas` opens `My Ideas.md`. One match opens straight away; with several you get the list (`Tab` to move, `Enter` to open); with none you get a new note, and `Ctrl+S` offers to save it under that name.
+
+Files outside your vaults are remembered once you open them. Open a config file once with `omanote ~/.config/hypr/hyprland.lua`, and from then on `omanote hyprland` or `Ctrl+P` and a few letters (`hypr`, `bind lua`) finds it again, shown by where it is. The list is `~/.omanote/recent.txt`, newest first; files that are gone drop out of it.
 
 Write first, name it later: on a new note `Ctrl+S` asks where to keep it (a vault, or the current folder), with the file name prefilled from your first line (`# Trip plan` → `trip-plan.md`). From then on notes save themselves as you type. A note that has no file yet is never dropped silently: quitting, `Ctrl+N` or opening another note asks where to save it first (or `Ctrl+D` to discard it).
 

@@ -549,13 +549,17 @@ fn draw_save_as(f: &mut Frame, p: &SaveAs, toast: Option<&str>, area: Rect) {
 /// The note finder: what you typed, then the matches.
 /// A note's name in a list: the folder part is quiet, the name is not, and
 /// what matched the query stands out.
-fn note_name(note: &Note, hits: &[usize]) -> Vec<Span<'static>> {
+/// A note's name, its folders quiet and what matched lit. A name too long
+/// for `room` loses the start of its folders, never the file's own name.
+fn note_name(note: &Note, hits: &[usize], room: usize) -> Vec<Span<'static>> {
     let look = theme::get();
     let name_start = note.name.iter().rposition(|c| *c == '/').map_or(0, |k| k + 1);
-    note.name
-        .iter()
-        .enumerate()
-        .map(|(k, c)| {
+    let cut = note.name.len().saturating_sub(room.max(2) - 1).min(name_start);
+    let cut = if note.name.len() > room { cut.max(1) } else { 0 };
+    let ellipsis = (cut > 0).then(|| Span::styled("…", look.muted()));
+    ellipsis
+        .into_iter()
+        .chain(note.name.iter().enumerate().skip(cut).map(|(k, c)| {
             let style = if hits.contains(&k) {
                 Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)
             } else if k < name_start {
@@ -564,7 +568,7 @@ fn note_name(note: &Note, hits: &[usize]) -> Vec<Span<'static>> {
                 Style::default()
             };
             Span::styled(c.to_string(), style)
-        })
+        }))
         .collect()
 }
 
@@ -649,7 +653,10 @@ fn draw_mention(f: &mut Frame, m: &Mention, cursor: (u16, u16), area: Rect) {
     let mut lines = Vec::new();
     for i in first..first + shown as usize {
         let (text, note) = match p.row(i) {
-            Some(Row::Note(note, hits)) => (note_name(note, hits), age(note.modified)),
+            Some(Row::Note(note, hits)) => {
+                let age = age(note.modified);
+                (note_name(note, hits, (w as usize).saturating_sub(7 + age.chars().count())), age)
+            }
             Some(Row::Create(name)) => (vec![Span::styled(format!("+ Create “{name}.md”"), Style::new().fg(Color::Green))], String::new()),
             Some(Row::Line(note, hit)) => found_line(note, hit, w - 2),
             None if p.in_contents().is_some() => (vec![Span::styled("No note says that", look.muted())], String::new()),
@@ -693,7 +700,10 @@ fn draw_picker(f: &mut Frame, p: &Picker, area: Rect) {
     let first = p.selected.saturating_sub(shown - 1);
     for i in first..first + shown {
         let (text, note) = match p.row(i) {
-            Some(Row::Note(note, hits)) => (note_name(note, hits), age(note.modified)),
+            Some(Row::Note(note, hits)) => {
+                let age = age(note.modified);
+                (note_name(note, hits, (w as usize).saturating_sub(5 + age.chars().count())), age)
+            }
             Some(Row::Create(name)) => (vec![Span::styled(format!("+ New note “{name}”"), Style::new().fg(Color::Green))], String::new()),
             Some(Row::Line(note, hit)) => found_line(note, hit, w),
             None if p.too_short() => (vec![Span::styled("Searching inside your notes: type a word", look.muted())], String::new()),
