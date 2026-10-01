@@ -101,6 +101,57 @@ pub fn is_markdown(path: Option<&std::path::Path>) -> bool {
     }
 }
 
+/// Where `rows` of `old` are in `new`. The lines the two have in common, in
+/// order and as many as there can be (a diff), stay together; a line that
+/// was changed or taken away goes where what replaced it starts. With more
+/// than about a thousand changed lines each way, working that out costs more
+/// than it is worth, and a row stays where it was.
+fn follow<const N: usize>(old: &[Vec<char>], new: &[Vec<char>], rows: [usize; N]) -> [usize; N] {
+    // Only what lies between the lines the same at the start and at the end needs working out.
+    let start = old.iter().zip(new).take_while(|(a, b)| a == b).count();
+    let end = old[start..].iter().rev().zip(new[start..].iter().rev()).take_while(|(a, b)| a == b).count();
+    let (a, b) = (&old[start..old.len() - end], &new[start..new.len() - end]);
+    let w = b.len() + 1;
+    let fits = (a.len() + 1) * w <= 1 << 20;
+    // How many lines a[i..] and b[j..] have in common, in order, at i * w + j.
+    let mut common = vec![0u32; if fits { (a.len() + 1) * w } else { 0 }];
+    if fits {
+        for i in (0..a.len()).rev() {
+            for j in (0..b.len()).rev() {
+                common[i * w + j] = if a[i] == b[j] { common[(i + 1) * w + j + 1] + 1 } else { common[(i + 1) * w + j].max(common[i * w + j + 1]) };
+            }
+        }
+    }
+    let at = |i: usize, j: usize| common[i * w + j];
+    rows.map(|row| {
+        if row < start || !fits && row < old.len() - end {
+            return row;
+        }
+        if row >= old.len() - end {
+            return row + new.len() - old.len();
+        }
+        // Down the diff to the row's line: kept lines in step, changed ones
+        // taken away before what replaced them is added.
+        let (r, mut i, mut j) = (row - start, 0, 0);
+        while i < r {
+            if j < b.len() && a[i] == b[j] {
+                (i, j) = (i + 1, j + 1);
+            } else if j < b.len() && at(i, j + 1) > at(i + 1, j) {
+                j += 1;
+            } else {
+                i += 1;
+            }
+        }
+        // A line that is kept: past the lines added before it, to where it is now.
+        if at(i + 1, j) < at(i, j) {
+            while j < b.len() && !(a[i] == b[j] && at(i + 1, j + 1) + 1 == at(i, j)) {
+                j += 1;
+            }
+        }
+        start + j
+    })
+}
+
 fn is_word(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
@@ -753,14 +804,16 @@ impl Editor {
     }
 
     /// The whole text replaced, as by a formatter: one undo step, and the
-    /// cursor and the view stay where they were, as far as the new text allows.
+    /// cursor and the view stay with the lines they were on, though lines
+    /// above were added or taken away, as far as the new text allows.
     pub fn replace_all(&mut self, text: &str) {
         self.checkpoint(Edit::Other);
-        let (cursor, top) = (self.cursor, self.top);
-        self.lines = text.split('\n').map(|l| l.trim_end_matches('\r').chars().collect()).collect();
+        let old = std::mem::replace(&mut self.lines, text.split('\n').map(|l| l.trim_end_matches('\r').chars().collect()).collect());
         if self.lines.is_empty() {
             self.lines.push(Vec::new());
         }
+        let [row, top] = follow(&old, &self.lines, [self.cursor.row, self.top]);
+        let (cursor, top) = (Pos { row, ..self.cursor }, top);
         let row = cursor.row.min(self.lines.len() - 1);
         self.cursor = Pos { row, col: cursor.col.min(self.lines[row].len()) };
         self.anchor = None;
@@ -1603,4 +1656,13 @@ mod tests {
         assert_eq!(ed.text(), "see \n");
     }
 
+    #[test]
+    fn rows_follow_their_lines_through_a_rewrite() {
+        let lines = |text: &str| text.split('\n').map(|l| l.chars().collect()).collect::<Vec<Vec<char>>>();
+        let old = lines("a\nb\nold\nc\nd\ne");
+        let new = lines("a\nB1\nB2\nb\nnew one\nnew two\nc\nd\ne");
+        assert_eq!(follow(&old, &new, [0, 1, 2, 3, 5]), [0, 3, 4, 6, 8], "kept lines move with what was added above them; a changed one goes where its replacement starts");
+        assert_eq!(follow(&old, &lines("a\nd\ne"), [3]), [1], "a line taken away: where the text after it now is");
+        assert_eq!(follow(&old, &old, [4]), [4]);
+    }
 }

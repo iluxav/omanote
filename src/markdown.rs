@@ -72,13 +72,18 @@ fn fence_char(line: &[char]) -> Option<char> {
     ((c == '`' || c == '~') && run_len(line, i, line.len(), c) >= 3).then_some(c)
 }
 
-/// The language a fence names: ```` ```lua ````, `~~~ toml`, ```` ```rust,ignore ````.
-fn fence_lang(line: &[char]) -> Option<Lang> {
+/// The word a fence names its language by: `lua` in ```` ```lua ````, `toml`
+/// in `~~~ toml`, `rust` in ```` ```rust,ignore ````.
+pub fn fence_name(line: &[char]) -> Option<String> {
     let i = indent(line);
     let from = i + run_len(line, i, line.len(), *line.get(i)?);
     let info: String = line[from..].iter().collect();
     let name = info.trim().split(|c: char| c.is_whitespace() || matches!(c, ',' | '{' | ':')).next()?;
-    Lang::named(name)
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+fn fence_lang(line: &[char]) -> Option<Lang> {
+    Lang::named(&fence_name(line)?)
 }
 
 /// Classify each line as normal text or part of a fenced code block.

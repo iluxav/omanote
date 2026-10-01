@@ -14,15 +14,17 @@
 
 use std::io::{Read, Write};
 use std::os::unix::process::CommandExt;
-use std::path::Path;
-use std::process::{Command as Process, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command as Process, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::editor::{Editor, Pos};
-use crate::syntax::Lang;
+use crate::format::{self, Formatter};
 
 /// A command that says nothing for this long is stopped.
 const TIMEOUT: Duration = Duration::from_secs(180);
@@ -152,61 +154,6 @@ pub fn set(commands: &mut Vec<Command>, key: &str, value: &str) -> Result<(), St
     }
 }
 
-/// `format.<kind> = "..."`: a program that reads a file on its standard input
-/// and prints it back tidied. `kind` is a file extension (`lua`, `md`) or the
-/// name of a language omanote knows, so `sh` also covers `.bashrc`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Formatter {
-    pub kind: String,
-    pub run: String,
-    /// After Ctrl+S too, not only on Ctrl+W.
-    pub on_save: bool,
-}
-
-/// One line of the settings: `key` is what follows `format.`: `lua`, or `lua.save`.
-pub fn set_formatter(formatters: &mut Vec<Formatter>, key: &str, value: &str) -> Result<(), String> {
-    let (kind, property) = match key.rsplit_once('.') {
-        Some((kind, p)) if p.trim().eq_ignore_ascii_case("save") => (kind, "save"),
-        _ => (key, ""),
-    };
-    let kind = kind.trim().trim_start_matches('.').to_lowercase();
-    if kind.is_empty() || kind.contains(char::is_whitespace) {
-        return Err("the formatter needs a file kind: format.<extension> = \"<what to run>\", as in format.lua".into());
-    }
-    let at = formatters.iter().position(|f| f.kind == kind);
-    match (property, at) {
-        ("", _) if value.is_empty() => Err(format!("format.{kind} needs something to run")),
-        ("", Some(at)) => {
-            formatters[at].run = value.to_string();
-            Ok(())
-        }
-        ("", None) => {
-            formatters.push(Formatter { kind, run: value.to_string(), on_save: true });
-            Ok(())
-        }
-        (_, None) => Err(format!("say what format.{kind} runs first: format.{kind} = \"...\"")),
-        (_, Some(at)) => {
-            formatters[at].on_save = match value.to_lowercase().as_str() {
-                "true" | "on" | "yes" => true,
-                "false" | "off" | "no" => false,
-                other => return Err(format!("format.{kind}.save is true or false, not `{other}`")),
-            };
-            Ok(())
-        }
-    }
-}
-
-/// The formatter for a file: the one named by its extension, else the one
-/// for its language. A note is markdown, `md`, whatever it is called.
-pub fn formatter<'a>(formatters: &'a [Formatter], path: Option<&Path>, markdown: bool) -> Option<&'a Formatter> {
-    let ext = path.and_then(|p| p.extension()).map(|e| e.to_string_lossy().to_lowercase());
-    let lang = Lang::of_path(path);
-    let by_extension = formatters.iter().find(|f| Some(&f.kind) == ext.as_ref());
-    by_extension.or_else(|| {
-        formatters.iter().find(|f| (markdown && matches!(f.kind.as_str(), "md" | "markdown")) || (lang.is_some() && Lang::named(&f.kind) == lang))
-    })
-}
-
 /// Ctrl+R: which command? Ctrl+Shift+W: which formatter?
 pub struct Palette {
     pub selected: usize,
@@ -239,10 +186,142 @@ fn text_of(lines: &[Vec<char>], from: Pos, to: Pos) -> String {
     out
 }
 
-pub struct Finished {
-    pub ok: bool,
-    pub stdout: String,
-    pub stderr: String,
+/// What a program is run with: the note its placeholders stand for, and
+/// where it runs.
+#[derive(Clone)]
+struct Place {
+    file: Option<PathBuf>,
+    dir: PathBuf,
+    line: usize,
+    selection: String,
+}
+
+impl Place {
+    fn of(ed: &Editor, dir: &Path, selection: String) -> Place {
+        let file = ed.path.as_ref().map(|p| std::path::absolute(p).unwrap_or_else(|_| p.clone()));
+        Place { file, dir: dir.to_path_buf(), line: ed.cursor.row + 1, selection }
+    }
+
+    fn spawn(&self, run: &str) -> std::io::Result<Child> {
+        let text = |p: Option<&Path>| p.map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+        let name = self.file.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        // Placeholders become environment variables, quoted: a file name with a
+        // space or a quote in it cannot break the command, let alone run one.
+        let run = run
+            .replace("{file}", "\"$OMANOTE_FILE\"")
+            .replace("{dir}", "\"$OMANOTE_DIR\"")
+            .replace("{name}", "\"$OMANOTE_NAME\"")
+            .replace("{line}", "\"$OMANOTE_LINE\"")
+            .replace("{selection}", "\"$OMANOTE_SELECTION\"");
+        Process::new(shell())
+            .args(["-lc", &run])
+            .current_dir(&self.dir)
+            .env("OMANOTE_FILE", text(self.file.as_deref()))
+            .env("OMANOTE_DIR", text(Some(&self.dir)))
+            .env("OMANOTE_NAME", name)
+            .env("OMANOTE_LINE", self.line.to_string())
+            .env("OMANOTE_SELECTION", &self.selection)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            // Its own group, so Esc can stop the shell and whatever the shell started.
+            .process_group(0)
+            .spawn()
+    }
+}
+
+/// Esc, from the editor's side: stops the program running now, and any
+/// still to come after it.
+#[derive(Clone, Default)]
+struct Stop {
+    stopped: Arc<AtomicBool>,
+    /// The program running now; 0 between programs.
+    pid: Arc<AtomicU32>,
+}
+
+impl Stop {
+    fn stopped(&self) -> bool {
+        self.stopped.load(Ordering::SeqCst)
+    }
+
+    fn cancel(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
+        self.kill();
+    }
+
+    /// The program and everything it started, being a group of their own.
+    fn kill(&self) {
+        let pid = self.pid.load(Ordering::SeqCst);
+        // Group 0 would be omanote's own.
+        if pid != 0 {
+            unsafe { libc::kill(-(pid as i32), libc::SIGTERM) };
+        }
+    }
+}
+
+/// The first line of `text` that says something.
+fn first(text: &str) -> String {
+    text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("").to_string()
+}
+
+/// Run `run` through the shell with `input` on its standard input, and wait
+/// for it: what it printed, less the line break it ended with, or why it
+/// failed, in a line.
+fn execute(run: &str, input: &str, place: &Place, stop: &Stop) -> Result<String, String> {
+    if stop.stopped() {
+        return Err("stopped".into());
+    }
+    let mut child = place.spawn(run).map_err(|e| format!("could not start it: {e}"))?;
+    stop.pid.store(child.id(), Ordering::SeqCst);
+    // Esc may have come before there was a pid to stop.
+    if stop.stopped() {
+        stop.kill();
+    }
+    let (mut stdin, stdout, stderr) = (child.stdin.take(), child.stdout.take(), child.stderr.take());
+    let input = input.to_string();
+    // Fed from a thread of its own: a command that talks before it has
+    // finished listening would otherwise leave both sides waiting.
+    std::thread::spawn(move || {
+        if let Some(stdin) = stdin.as_mut() {
+            let _ = stdin.write_all(input.as_bytes());
+        }
+        drop(stdin);
+    });
+    let read = |pipe: Option<&mut dyn Read>| {
+        let mut bytes = Vec::new();
+        if let Some(pipe) = pipe {
+            let _ = pipe.take(MAX_OUTPUT).read_to_end(&mut bytes);
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    let mut stderr = stderr;
+    let errors = std::thread::spawn(move || read(stderr.as_mut().map(|p| p as &mut dyn Read)));
+    let mut stdout = stdout;
+    let said = read(stdout.as_mut().map(|p| p as &mut dyn Read));
+    let ok = child.wait().is_ok_and(|s| s.success());
+    stop.pid.store(0, Ordering::SeqCst);
+    if !ok {
+        let why = first(&errors.join().unwrap_or_default());
+        let why = if why.is_empty() { first(&said) } else { why };
+        // The shell's way of saying the program is not installed, cut
+        // down to the program: `bash: line 1: stylua: command not found`.
+        let missing = why.strip_suffix(": command not found").or_else(|| why.strip_suffix(": not found"));
+        return Err(match missing.and_then(|m| m.rsplit(": ").next()) {
+            Some(program) => format!("{program} is not installed"),
+            None => why,
+        });
+    }
+    // One trailing line break is the command ending its output, not part of the text.
+    let said = said.replace("\r\n", "\n");
+    Ok(said.strip_suffix('\n').unwrap_or(&said).to_string())
+}
+
+/// What a command, or a formatter's parts together, came back with.
+struct Answer {
+    /// What it printed, or why it failed.
+    said: Result<String, String>,
+    /// A formatter's parts left as they were while the rest were tidied, and why.
+    left: Vec<String>,
 }
 
 /// A command on its way: what it was given, where that came from, and the
@@ -253,10 +332,9 @@ pub struct Running {
     /// What went in, and the range it came from: `None` for `insert` with nothing selected.
     range: Option<(Pos, Pos)>,
     given: String,
-    pid: u32,
+    stop: Stop,
     started: Instant,
-    stopped: std::cell::Cell<bool>,
-    done: Receiver<Finished>,
+    done: Receiver<Answer>,
 }
 
 /// What to tell the user when a command is over.
@@ -272,84 +350,62 @@ fn shell() -> String {
     std::env::var("SHELL").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "/bin/sh".into())
 }
 
+/// Do `job` on a thread of its own, beside the editor.
+fn launch(name: &str, output: Output, range: Option<(Pos, Pos)>, given: String, job: impl FnOnce(&Stop) -> Answer + Send + 'static) -> Running {
+    let stop = Stop::default();
+    let theirs = stop.clone();
+    let (tx, done) = channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(job(&theirs));
+    });
+    Running { name: name.to_string(), output, range, given, stop, started: Instant::now(), done }
+}
+
 /// Start `command` on the note in `ed`. The text it works on is taken now;
 /// what it says is applied when it is done, by `Running::finish`.
 pub fn start(command: &Command, ed: &Editor, dir: &Path) -> Result<Running, String> {
     let selection = ed.selection();
-    let whole = command.output == Output::Whole;
     let range = match command.output {
         Output::Replace => Some(selection.or_else(|| paragraph(&ed.lines, ed.cursor.row)).ok_or("Select some text, or put the cursor in a paragraph")?),
-        Output::Whole => Some((Pos::default(), Pos { row: ed.lines.len() - 1, col: ed.lines[ed.lines.len() - 1].len() })),
         _ => selection,
     };
     let given = range.map(|(from, to)| text_of(&ed.lines, from, to)).unwrap_or_default();
-    // A formatter gets the file as it is on disk, final line break and all;
-    // the whole note is too big for an environment variable, and is not a selection.
-    let input = if whole { format!("{given}\n") } else { given.clone() };
-    let selected = if whole { String::new() } else { given.clone() };
+    let place = Place::of(ed, dir, given.clone());
+    let (run, input) = (command.run.clone(), given.clone());
+    Ok(launch(&command.name, command.output, range, given, move |stop| Answer { said: execute(&run, &input, &place, stop), left: Vec::new() }))
+}
 
-    let file = ed.path.as_ref().map(|p| std::path::absolute(p).unwrap_or_else(|_| p.clone()));
-    let text = |p: Option<&Path>| p.map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
-    let name = file.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-    // Placeholders become environment variables, quoted: a file name with a
-    // space or a quote in it cannot break the command, let alone run one.
-    let run = command
-        .run
-        .replace("{file}", "\"$OMANOTE_FILE\"")
-        .replace("{dir}", "\"$OMANOTE_DIR\"")
-        .replace("{name}", "\"$OMANOTE_NAME\"")
-        .replace("{line}", "\"$OMANOTE_LINE\"")
-        .replace("{selection}", "\"$OMANOTE_SELECTION\"");
-    let mut child = Process::new(shell())
-        .args(["-lc", &run])
-        .current_dir(dir)
-        .env("OMANOTE_FILE", text(file.as_deref()))
-        .env("OMANOTE_DIR", text(Some(dir)))
-        .env("OMANOTE_NAME", name)
-        .env("OMANOTE_LINE", (ed.cursor.row + 1).to_string())
-        .env("OMANOTE_SELECTION", &selected)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        // Its own group, so Esc can stop the shell and whatever the shell started.
-        .process_group(0)
-        .spawn()
-        .map_err(|e| format!("Could not start {}: {e}", command.name))?;
-
-    let pid = child.id();
-    let (tx, done) = channel();
-    let (mut stdin, stdout, stderr) = (child.stdin.take(), child.stdout.take(), child.stderr.take());
-    // Fed from a thread of its own: a command that talks before it has
-    // finished listening would otherwise leave both sides waiting.
-    std::thread::spawn(move || {
-        if let Some(stdin) = stdin.as_mut() {
-            let _ = stdin.write_all(input.as_bytes());
-        }
-        drop(stdin);
-    });
-    std::thread::spawn(move || {
-        let read = |pipe: Option<&mut dyn Read>| {
-            let mut bytes = Vec::new();
-            if let Some(pipe) = pipe {
-                let _ = pipe.take(MAX_OUTPUT).read_to_end(&mut bytes);
-            }
-            String::from_utf8_lossy(&bytes).into_owned()
-        };
-        let mut stderr = stderr;
-        let errors = std::thread::spawn(move || read(stderr.as_mut().map(|p| p as &mut dyn Read)));
-        let mut stdout = stdout;
-        let said = read(stdout.as_mut().map(|p| p as &mut dyn Read));
-        let ok = child.wait().is_ok_and(|s| s.success());
-        let _ = tx.send(Finished { ok, stdout: said, stderr: errors.join().unwrap_or_default() });
-    });
-    Ok(Running { name: command.name.clone(), output: command.output, range, given, pid, started: Instant::now(), stopped: std::cell::Cell::new(false), done })
+/// Start tidying the note in `ed`: through `whole`, and then, given
+/// `blocks`, each of its fenced blocks through the one for its language (see
+/// `format::tidy`). What comes back takes the whole note's place.
+pub fn start_format(whole: Option<Formatter>, blocks: Option<Vec<Formatter>>, ed: &Editor, dir: &Path) -> Running {
+    let last = ed.lines.len() - 1;
+    let range = (Pos::default(), Pos { row: last, col: ed.lines[last].len() });
+    let given = text_of(&ed.lines, range.0, range.1);
+    // The whole note is too big for an environment variable, and is not a selection.
+    let place = Place::of(ed, dir, String::new());
+    let text = given.clone();
+    launch("Format", Output::Whole, Some(range), given, move |stop| {
+        let tidied = format::tidy(&text, whole.as_ref(), blocks.as_deref(), |formatter, input, kind| {
+            // For a block, `{file}` is the note under the block's language,
+            // for a formatter that picks its rules from the name
+            // (`prettier --stdin-filepath {file}`).
+            let place = match (kind, &place.file) {
+                (Some(kind), Some(file)) => Place { file: Some(file.with_extension(kind)), ..place.clone() },
+                _ => place.clone(),
+            };
+            execute(&formatter.run, input, &place, stop)
+        });
+        let mut left = tidied.left;
+        let said = if tidied.done == 0 && !left.is_empty() { Err(left.remove(0)) } else { Ok(tidied.text) };
+        Answer { said, left }
+    })
 }
 
 impl Running {
     /// Esc: stop it, and everything it started.
     pub fn cancel(&self) {
-        self.stopped.set(true);
-        unsafe { libc::kill(-(self.pid as i32), libc::SIGTERM) };
+        self.stop.cancel();
     }
 
     pub fn seconds(&self) -> u64 {
@@ -361,8 +417,8 @@ impl Running {
     /// given is no longer where it was, nothing is overwritten: the result
     /// goes to `spare` (the clipboard) instead.
     pub fn finish(&self, ed: &mut Editor, spare: &mut Option<String>) -> Outcome {
-        let done = match self.done.try_recv() {
-            Ok(done) => done,
+        let answer = match self.done.try_recv() {
+            Ok(answer) => answer,
             Err(std::sync::mpsc::TryRecvError::Empty) if self.started.elapsed() > TIMEOUT => {
                 self.cancel();
                 return Outcome::Said(format!("{} took more than {} minutes and was stopped", self.name, TIMEOUT.as_secs() / 60));
@@ -370,24 +426,19 @@ impl Running {
             Err(std::sync::mpsc::TryRecvError::Empty) => return Outcome::Waiting,
             Err(_) => return Outcome::Said(format!("{} was stopped", self.name)),
         };
-        let first = |text: &str| text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("").to_string();
-        if self.stopped.get() {
+        if self.stop.stopped() {
             return Outcome::Said(format!("{}: stopped, nothing changed", self.name));
         }
-        if !done.ok {
-            let why = first(&done.stderr);
-            let why = if why.is_empty() { first(&done.stdout) } else { why };
-            // The shell's way of saying the program is not installed, cut
-            // down to the program: `bash: line 1: stylua: command not found`.
-            let missing = why.strip_suffix(": command not found").or_else(|| why.strip_suffix(": not found"));
-            let why = match missing.and_then(|m| m.rsplit(": ").next()) {
-                Some(program) => format!("{program} is not installed"),
-                None => why,
-            };
-            return Outcome::Said(format!("{} failed{}", self.name, if why.is_empty() { String::new() } else { format!(": {why}") }));
-        }
-        // One trailing line break is the command ending its output, not part of the text.
-        let said = done.stdout.strip_suffix('\n').unwrap_or(&done.stdout).replace("\r\n", "\n");
+        // What a formatter could not tidy, said after how the rest went.
+        let left = match answer.left.as_slice() {
+            [] => String::new(),
+            [one] => format!(" · {one}"),
+            [first, rest @ ..] => format!(" · {first} (and {} more)", rest.len()),
+        };
+        let said = match answer.said {
+            Ok(said) => said,
+            Err(why) => return Outcome::Said(format!("{} failed{}{left}", self.name, if why.is_empty() { String::new() } else { format!(": {why}") })),
+        };
         if self.output == Output::Message {
             let line = first(&said);
             return Outcome::Said(if line.is_empty() { format!("{}: done", self.name) } else { format!("{}: {line}", self.name) });
@@ -410,7 +461,8 @@ impl Running {
             return Outcome::Said(format!("The text changed while {} ran: its result is in the clipboard (Ctrl+V)", self.name));
         }
         match (self.output, self.range) {
-            (Output::Replace | Output::Whole, _) if said == self.given => return Outcome::Same(format!("{}: nothing to change", self.name)),
+            (Output::Replace | Output::Whole, _) if said == self.given && left.is_empty() => return Outcome::Same(format!("{}: nothing to change", self.name)),
+            (Output::Replace | Output::Whole, _) if said == self.given => return Outcome::Said(format!("{}: nothing to change{left}", self.name)),
             (Output::Whole, _) => ed.replace_all(&said),
             (Output::Replace, Some((from, to))) => {
                 ed.move_to(from, false);
@@ -426,7 +478,7 @@ impl Running {
                 ed.insert_str(&said);
             }
         }
-        Outcome::Said(format!("{}: done · Ctrl+Z undoes it", self.name))
+        Outcome::Said(if left.is_empty() { format!("{}: done · Ctrl+Z undoes it", self.name) } else { format!("{}: done{left}", self.name) })
     }
 }
 
@@ -488,37 +540,19 @@ mod tests {
         assert_eq!(bound(&all, &press(KeyCode::Char('d'), KeyModifiers::NONE)), None);
     }
 
-    #[test]
-    fn formatters_are_read_and_found_by_file_kind() {
-        let mut all = Vec::new();
-        set_formatter(&mut all, "lua", "stylua -").unwrap();
-        set_formatter(&mut all, "Lua.save", "false").unwrap();
-        set_formatter(&mut all, "sh", "shfmt").unwrap();
-        set_formatter(&mut all, "md", "prettier --parser markdown").unwrap();
-        assert_eq!(all[0], Formatter { kind: "lua".into(), run: "stylua -".into(), on_save: false });
-        assert!(all[1].on_save, "on Ctrl+S unless told otherwise");
-        set_formatter(&mut all, "lua", "stylua --indent-type Spaces -").unwrap();
-        assert_eq!((all.len(), all[0].run.as_str(), all[0].on_save), (3, "stylua --indent-type Spaces -", false), "said again: it replaces, the rest kept");
-        let said = |all: &mut Vec<Formatter>, key: &str, value: &str| set_formatter(all, key, value).unwrap_err();
-        assert!(said(&mut all, "py.save", "false").contains("say what format.py runs first"));
-        assert!(said(&mut all, "lua.save", "maybe").contains("true or false"));
-        assert!(said(&mut all, "", "x").contains("needs a file kind") && said(&mut all, "lua", "").contains("something to run"));
+    fn formatter(kind: &str, run: &str) -> Formatter {
+        Formatter { kind: kind.into(), run: run.into(), on_save: true }
+    }
 
-        let by = |path: &str| formatter(&all, Some(Path::new(path)), crate::editor::is_markdown(Some(Path::new(path)))).map(|f| f.kind.as_str());
-        assert_eq!(by("/v/init.lua"), Some("lua"));
-        assert_eq!(by("/home/me/.bashrc"), Some("sh"), "by language when the name says it");
-        assert_eq!(by("/v/run.zsh"), Some("sh"));
-        assert_eq!(by("/v/notes/trip.md"), Some("md"));
-        assert_eq!(by("/v/notes/trip.markdown"), Some("md"));
-        assert_eq!(by("/v/x.toml"), None);
-        assert_eq!(formatter(&all, None, true).map(|f| f.kind.as_str()), Some("md"), "a new note is markdown");
+    fn whole(run: &str, ed: &Editor) -> Running {
+        start_format(Some(formatter("txt", run)), None, ed, Path::new("/"))
     }
 
     #[test]
     fn a_formatter_gets_the_whole_note_and_keeps_the_cursor() {
         let mut ed = Editor::new("b\n\na\nc", Some("/tmp/list.txt".into()));
         ed.move_to(Pos { row: 3, col: 1 }, false);
-        let running = start(&command("sort", Output::Whole), &ed, Path::new("/")).unwrap();
+        let running = whole("sort", &ed);
         assert!(wait(&running, &mut ed).0.contains("done"));
         assert_eq!(ed.text(), "\na\nb\nc\n");
         assert_eq!((ed.cursor, ed.selection()), (Pos { row: 3, col: 1 }, None), "the cursor stays put");
@@ -526,22 +560,40 @@ mod tests {
         assert_eq!(ed.text(), "b\n\na\nc\n", "one undo");
 
         // The file goes in as it is on disk, with its final line break.
-        let running = start(&command("tail -c 1 | od -An -tx1 | tr -d ' \\n'", Output::Whole), &ed, Path::new("/")).unwrap();
+        let running = whole("tail -c 1 | od -An -tx1 | tr -d ' \\n'", &ed);
         wait(&running, &mut ed);
         assert_eq!(ed.text(), "0a\n");
         ed.undo();
 
-        let running = start(&command("cat", Output::Whole), &ed, Path::new("/")).unwrap();
+        let running = whole("cat", &ed);
         assert!(matches!(wait_for(&running, &mut ed).0, Outcome::Same(_)), "the same text back is not a change");
         assert!(!ed.undo(), "and leaves nothing to undo");
 
         // Typing while it runs, even after the end: the note is left alone, and the clipboard too.
-        let running = start(&command("sleep 0.3; echo late", Output::Whole), &ed, Path::new("/")).unwrap();
+        let running = whole("sleep 0.3; echo late", &ed);
         ed.move_to(Pos { row: 3, col: 1 }, false);
         ed.insert_str("zz");
         let (said, spare) = wait(&running, &mut ed);
         assert!(said.contains("left alone"), "{said}");
         assert_eq!((ed.text().as_str(), spare), ("b\n\na\nczz\n", None));
+    }
+
+    #[test]
+    fn a_notes_fenced_blocks_go_through_the_formatter_for_their_language() {
+        let note = "# Trip\n\n```yml\nk: v\n```\n\nprose stays\n\n```sh\nls\n```\n\n```lua\nx()\n```";
+        let mut ed = Editor::new(note, Some("/v/trip.md".into()));
+        ed.move_to(Pos { row: 6, col: 3 }, false);
+        let blocks = vec![formatter("yaml", "tr a-z A-Z; echo 'x: 1'"), formatter("sh", "echo {file}"), formatter("lua", "exit 1")];
+        let running = start_format(None, Some(blocks), &ed, Path::new("/"));
+        assert_eq!(wait(&running, &mut ed).0, "Format: done · the lua block at line 14 failed", "a failed block is named where it is now");
+        assert_eq!(ed.text(), "# Trip\n\n```yml\nK: V\nx: 1\n```\n\nprose stays\n\n```sh\n/v/trip.sh\n```\n\n```lua\nx()\n```\n", "{{file}} is the note under the block's language");
+        assert_eq!(ed.cursor, Pos { row: 7, col: 3 }, "the cursor stays with its text, a line further down");
+        assert!(ed.undo());
+        assert_eq!(ed.text(), format!("{note}\n"), "one undo");
+
+        let running = start_format(None, Some(vec![formatter("lua", "exit 1")]), &ed, Path::new("/"));
+        assert_eq!(wait(&running, &mut ed).0, "Format failed: the lua block at line 13 failed");
+        assert_eq!(ed.text(), format!("{note}\n"));
     }
 
     #[test]
@@ -607,9 +659,19 @@ mod tests {
 
         // Esc stops a command, and whatever it started.
         let running = start(&command("sleep 30; echo late", Output::Insert), &ed, Path::new("/")).unwrap();
+        // It starts on its own thread; wait for it to be there to stop.
+        let mut pid = 0;
+        for _ in 0..300 {
+            pid = running.stop.pid.load(Ordering::SeqCst);
+            if pid != 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_ne!(pid, 0, "it started");
         running.cancel();
         assert!(wait(&running, &mut ed).0.contains("stopped"));
-        let gone = std::process::Command::new("sh").args(["-c", &format!("kill -0 -- -{} 2>/dev/null", running.pid)]).status().unwrap();
+        let gone = std::process::Command::new("sh").args(["-c", &format!("kill -0 -- -{pid} 2>/dev/null")]).status().unwrap();
         assert!(!gone.success(), "the shell and the sleep it started are both gone");
         assert_eq!(ed.text(), "Fixed. and more\n");
     }

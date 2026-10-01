@@ -893,7 +893,7 @@ fn draw_hints(f: &mut Frame, split: bool, ed: &Editor, config: &Config, area: Re
         hints.insert(1, ("F6", "other note"));
     }
     // A formatter is worth a hint only where there is one to run.
-    if crate::commands::formatter(&config.formatters, ed.path.as_deref(), markdown).is_some() {
+    if crate::format::any(&config.formatters, ed.path.as_deref(), markdown, &ed.lines, &ed.blocks) {
         let at = hints.iter().position(|h| h.0 == "^S").map_or(hints.len(), |i| i + 1);
         hints.insert(at, ("^W", "format"));
     }

@@ -8,6 +8,7 @@ mod desktop;
 mod diacritics;
 mod editor;
 mod find;
+mod format;
 mod grammar;
 mod images;
 mod layout;
@@ -17,6 +18,7 @@ mod mention;
 mod now;
 mod pane;
 mod picker;
+mod pins;
 mod recent;
 mod remind;
 mod saveas;
@@ -239,39 +241,41 @@ impl App {
         }
     }
 
-    /// Ctrl+W, or Ctrl+S just done: the file's formatter from the settings
-    /// gets the whole note, and its answer takes the note's place. It runs
+    /// Ctrl+W, or Ctrl+S just done: the file goes through its formatter
+    /// from the settings, and a note's fenced blocks each through the one for
+    /// their language after. The answer takes the note's place. It runs
     /// beside the editor like any command; `poll_command` puts the result in.
+    /// After Ctrl+S, only the formatters that run on save.
     fn format(&mut self, after_save: bool) {
-        let found = commands::formatter(&self.settings.formatters, self.ed.path.as_deref(), self.ed.markdown);
-        let Some(formatter) = found.filter(|f| f.on_save || !after_save).cloned() else {
+        let usable: Vec<format::Formatter> = self.settings.formatters.iter().filter(|f| f.on_save || !after_save).cloned().collect();
+        let (path, markdown) = (self.ed.path.as_deref(), self.ed.markdown);
+        if !format::any(&usable, path, markdown, &self.ed.lines, &self.ed.blocks) {
             if !after_save {
-                let ext = self.ed.path.as_deref().and_then(|p| p.extension()).map(|e| e.to_string_lossy().to_lowercase());
-                let kind = ext.unwrap_or_else(|| if self.ed.markdown { "md".into() } else { "<kind>".into() });
-                self.say(format!("No formatter for this file: format.{kind} = \"...\" in the settings (omanote --config)"));
+                let ext = path.and_then(|p| p.extension()).map(|e| e.to_string_lossy().to_lowercase());
+                self.say(match ext {
+                    _ if markdown => "No formatter for this note or its code blocks: format.md, or format.<language> for ```<language>, in the settings (omanote --config)".into(),
+                    Some(kind) => format!("No formatter for this file: format.{kind} = \"...\" in the settings (omanote --config)"),
+                    None => "No formatter for this file: format.<kind> = \"...\" in the settings (omanote --config)".into(),
+                });
             }
             return;
-        };
-        self.start_formatter(formatter, after_save);
+        }
+        let whole = format::formatter(&usable, path, markdown).cloned();
+        self.start_formatter(whole, markdown.then_some(usable), after_save);
     }
 
-    /// Put the whole note through `formatter`, beside the editor like any command.
-    fn start_formatter(&mut self, formatter: commands::Formatter, after_save: bool) {
+    /// Put the whole note through `whole`, and then its fenced blocks through
+    /// `blocks`, beside the editor like any command.
+    fn start_formatter(&mut self, whole: Option<format::Formatter>, blocks: Option<Vec<format::Formatter>>, after_save: bool) {
         if let Some(running) = &self.running {
             if !after_save {
                 return self.say(format!("{} is still running · Esc stops it", running.name));
             }
             return;
         }
-        let command = commands::Command { name: "Format".into(), run: formatter.run, output: commands::Output::Whole, key: None };
-        match commands::start(&command, &self.ed, &self.command_dir()) {
-            Ok(running) => {
-                self.mention = None;
-                self.running = Some(running);
-                self.format_saves = after_save;
-            }
-            Err(e) => self.say(e),
-        }
+        self.mention = None;
+        self.running = Some(commands::start_format(whole, blocks, &self.ed, &self.command_dir()));
+        self.format_saves = after_save;
     }
 
     /// Tell the sync about saves it has not heard of yet.
@@ -1337,7 +1341,7 @@ impl App {
         if self.settings.formatters.is_empty() {
             return self.say("No formatters yet. Add yours in the settings (omanote --config): format.lua = \"stylua -\"");
         }
-        let own = commands::formatter(&self.settings.formatters, self.ed.path.as_deref(), self.ed.markdown);
+        let own = format::formatter(&self.settings.formatters, self.ed.path.as_deref(), self.ed.markdown);
         let selected = own.and_then(|f| self.settings.formatters.iter().position(|g| g.kind == f.kind)).unwrap_or(0);
         self.mention = None;
         self.palette = Some(commands::Palette { selected, formatters: true });
@@ -1372,7 +1376,7 @@ impl App {
             return self.run_command(at);
         }
         if let Some(formatter) = self.settings.formatters.get(at).cloned() {
-            self.start_formatter(formatter, false);
+            self.start_formatter(Some(formatter), None, false);
         }
     }
 
@@ -1811,7 +1815,8 @@ impl App {
             self.toast = Some((line, Instant::now()));
         }
         // A click picks the side. Inside the pane the mouse is ours, not the
-        // assistant's: drag selects (copied on release), the wheel scrolls back.
+        // assistant's: drag selects (copied on release), the wheel scrolls back
+        // (or scrolls the assistant, if it asked for the mouse).
         if self.pane.is_some() && self.save_as.is_none() && self.picker.is_none() {
             let in_pane = m.column >= self.pane_x;
             if matches!(m.kind, MouseEventKind::Down(_)) {
@@ -1825,8 +1830,8 @@ impl App {
                 let mut copied = None;
                 if let Some(pane) = &mut self.pane {
                     match m.kind {
-                        MouseEventKind::ScrollUp => pane.scroll(3),
-                        MouseEventKind::ScrollDown => pane.scroll(-3),
+                        MouseEventKind::ScrollUp => pane.wheel(true, row, col),
+                        MouseEventKind::ScrollDown => pane.wheel(false, row, col),
                         MouseEventKind::Down(MouseButton::Left) => pane.select_from(row, col),
                         MouseEventKind::Drag(MouseButton::Left) => pane.select_to(row, col),
                         MouseEventKind::Up(MouseButton::Left) => copied = pane.selected_text(),
@@ -2056,9 +2061,11 @@ omanote — a small markdown note editor
                               what comes out takes its place: grammar, translation, dates
   Ctrl+W inside the editor    tidy the file with its formatter: format.<kind> = \"<what to run>\"
                               in the settings, by extension or language (format.lua = \"stylua -\",
-                              format.md = \"prettier --parser markdown\"). Ctrl+S runs it too,
-                              after saving; Ctrl+Z undoes it. Ctrl+Shift+W (or Alt+W) lists
-                              them to pick one: for a note that has no file yet
+                              format.md = \"prettier --parser markdown\"). In a note, each
+                              ```yaml, ```sh … block goes through the one for its language.
+                              Ctrl+S runs it too, after saving; Ctrl+Z undoes it.
+                              Ctrl+Shift+W (or Alt+W) lists them to pick one: for a note
+                              that has no file yet
   @ inside the editor         link a note: type @ and a few letters, pick from the list;
                               a note created there opens beside this one, ready to write
                               (the last entry creates a note by that name), Enter
@@ -2097,6 +2104,15 @@ Vaults (where Ctrl+P looks; new notes go in ~/.omanote/docs):
   omanote --vlrm <name>       forget a vault (folder, owner/repo or name); files are kept
   omanote --vls               list vaults
   omanote --sync              sync every GitHub vault now: pull, then push
+
+Pins (a project's docs, read and edited from a vault):
+  omanote --pin <file> --as <name>
+                              inside a project: link the file into a vault as <name>.md
+                              (asks which vault) and list it in the vault's index.md.
+                              The project file stays the only copy: edits from the vault
+                              change it. Without --as the name is the project's folder
+  omanote --pins              list pins, and flag the ones whose file moved or was deleted
+  omanote --unpin <name>      remove a pin; the project's file is not touched
 
 Desktop:
   omanote --new [name]        a new note, even if one by that name exists
@@ -2149,6 +2165,8 @@ fn cli(args: &[String]) -> Result<(Target, bool, bool, Option<String>, Land), St
     let mut agent: Option<String> = None;
     // `--line 12 --match kyoto`: how the desktop popup opens a line it found.
     let (mut line, mut word) = (None, String::new());
+    // `--pin README.md --as my-project`: the two can come in either order.
+    let (mut pin, mut pin_as) = (None, None);
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         let mut value = |what: &str| it.next().cloned().ok_or(format!("{arg} needs {what}"));
@@ -2157,6 +2175,16 @@ fn cli(args: &[String]) -> Result<(Target, bool, bool, Option<String>, Land), St
             "--vlgh" => vaults::add_github(&home, &value("a GitHub repo, like owner/repo")?)?,
             "--vlrm" => vaults::remove(&home, &value("the vault to remove")?)?,
             "--vls" => vaults::list(&home),
+            "--pin" => {
+                pin = Some(value("the project file to pin, like README.md")?);
+                continue;
+            }
+            "--as" => {
+                pin_as = Some(value("a name for the pin")?);
+                continue;
+            }
+            "--unpin" => pins::unpin(&vaults::all(&home), &value("the pin to remove")?)?,
+            "--pins" => pins::list(&vaults::all(&home)),
             "--omarchy" => desktop::integrate(),
             "--find" => {
                 let query: Vec<String> = it.by_ref().cloned().collect();
@@ -2233,6 +2261,14 @@ fn cli(args: &[String]) -> Result<(Target, bool, bool, Option<String>, Land), St
         };
         println!("{}", done.trim_end());
         std::process::exit(0);
+    }
+    match (pin, pin_as) {
+        (Some(file), name) => {
+            println!("{}", pins::pin(&vaults::all(&home), &file, name.as_deref())?.trim_end());
+            std::process::exit(0);
+        }
+        (None, Some(_)) => return Err("--as names a pin: omanote --pin README.md --as my-project".to_string()),
+        (None, None) => {}
     }
     Ok((target(&words), keys, demo, agent, line.map(|l| (l, word))))
 }

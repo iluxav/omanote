@@ -103,10 +103,17 @@ fn walk(dir: &Path, root: &Path, prefix: &str, types: &[&str], depth: usize, max
                 walk(&path, root, prefix, types, depth + 1, max_depth, out);
             }
         } else if path.extension().is_some_and(|e| types.iter().any(|t| e.eq_ignore_ascii_case(t))) {
+            // A link (a pin, `--pin`) counts by the file it points to: when that
+            // last changed, and not at all once it is gone, since saving there
+            // would bring back a file at a place the project has left.
+            let meta = if kind.is_symlink() { std::fs::metadata(&path) } else { entry.metadata() };
+            if kind.is_symlink() && !meta.as_ref().is_ok_and(|m| m.is_file()) {
+                continue;
+            }
             let rel = path.strip_prefix(root).unwrap_or(&path).with_extension("");
             let name: Vec<char> = format!("{prefix}{}", rel.to_string_lossy()).chars().collect();
             let lower = name.iter().flat_map(|c| c.to_lowercase()).collect();
-            let modified = entry.metadata().and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH);
+            let modified = meta.and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH);
             out.push(Note { path, name, lower, modified });
         }
     }

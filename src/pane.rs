@@ -5,8 +5,11 @@
 //! we paint that screen into a rectangle beside the note and turn key presses
 //! back into the bytes a terminal would send. It is a small emulator, not a
 //! full one: colours, cursor movement, the alternate screen and bracketed paste
-//! work; mouse reporting and terminal-specific protocols do not. The mouse is
-//! ours instead: drag selects text (copied on release), the wheel scrolls back.
+//! work; terminal-specific protocols do not. The mouse is ours: drag selects
+//! text (copied on release), and the wheel scrolls back, except in a program
+//! that asked for the mouse, which gets the wheel to scroll itself. That is
+//! Claude Code full screen: it draws on the alternate screen, which keeps no
+//! history to scroll back to.
 
 use std::io::{Read, Write};
 use std::path::Path;
@@ -110,6 +113,25 @@ impl Pane {
         }
         self.selection = None;
         self.dirty.store(true, Ordering::Relaxed);
+    }
+
+    /// The mouse wheel turned over the pane at `row`, `col` (on its screen).
+    /// A program that asked for the mouse is sent the wheel, the way a
+    /// terminal would, and scrolls itself; otherwise the pane scrolls back.
+    /// Either way a notch is three rows: a program scrolls a row a report,
+    /// so it gets three, as Alacritty sends.
+    pub fn wheel(&mut self, up: bool, row: u16, col: u16) {
+        let reported = self.parser.lock().ok().and_then(|p| {
+            let screen = p.screen();
+            (screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None).then(|| wheel_bytes(up, row, col, screen.mouse_protocol_encoding()).repeat(3))
+        });
+        match reported {
+            Some(bytes) => {
+                self.selection = None;
+                let _ = self.writer.write_all(&bytes).and_then(|_| self.writer.flush());
+            }
+            None => self.scroll(if up { 3 } else { -3 }),
+        }
     }
 
     /// How far back the view is scrolled; 0 is the live screen.
@@ -223,6 +245,22 @@ fn color(c: vt100::Color) -> Color {
         vt100::Color::Default => Color::Reset,
         vt100::Color::Idx(i) => Color::Indexed(i),
         vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
+    }
+}
+
+/// The bytes a terminal sends for a turn of the mouse wheel at `row`, `col`
+/// (from 0), in the encoding the program asked for (xterm conventions).
+fn wheel_bytes(up: bool, row: u16, col: u16, encoding: vt100::MouseProtocolEncoding) -> Vec<u8> {
+    let (button, x, y) = (if up { 64u32 } else { 65 }, u32::from(col) + 1, u32::from(row) + 1);
+    match encoding {
+        vt100::MouseProtocolEncoding::Sgr => format!("\x1b[<{button};{x};{y}M").into_bytes(),
+        // One byte each, offset by 32, so nothing past column 223 can be said.
+        vt100::MouseProtocolEncoding::Default => [b"\x1b[M".as_slice(), &[button, x, y].map(|v| (v + 32).min(255) as u8)].concat(),
+        // The same, with values past 127 written as UTF-8.
+        vt100::MouseProtocolEncoding::Utf8 => {
+            let text: String = [button, x, y].iter().filter_map(|v| char::from_u32((v + 32).min(2047))).collect();
+            [b"\x1b[M".as_slice(), text.as_bytes()].concat()
+        }
     }
 }
 
@@ -375,6 +413,24 @@ mod tests {
         // Typing returns to the live screen.
         pane.scroll(10);
         pane.send_key(key(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(pane.scrolled(), 0);
+    }
+
+    #[test]
+    fn the_wheel_goes_to_a_program_that_asked_for_the_mouse() {
+        use vt100::MouseProtocolEncoding::{Default, Sgr, Utf8};
+        assert_eq!(wheel_bytes(true, 2, 4, Sgr), b"\x1b[<64;5;3M");
+        assert_eq!(wheel_bytes(false, 0, 0, Sgr), b"\x1b[<65;1;1M");
+        assert_eq!(wheel_bytes(true, 2, 4, Default), b"\x1b[M\x60\x25\x23");
+        assert_eq!(wheel_bytes(true, 0, 299, Utf8), [b"\x1b[M\x60".as_slice(), "\u{14c}".as_bytes(), b"\x21"].concat());
+
+        // Claude Code full screen: the alternate screen, the mouse asked for in
+        // SGR. The wheel reaches it, and the pane does not scroll back.
+        let script = r"printf '\033[?1049h\033[?1000h\033[?1006hready\n'; stty raw -echo; dd bs=1 count=30 2>/dev/null | cat -v; sleep 5";
+        let mut pane = Pane::spawn(script, &std::env::temp_dir(), &[], 6, 40).unwrap();
+        wait_for(&pane, "ready");
+        pane.wheel(true, 2, 4);
+        wait_for(&pane, &"^[[<64;5;3M".repeat(3));
         assert_eq!(pane.scrolled(), 0);
     }
 

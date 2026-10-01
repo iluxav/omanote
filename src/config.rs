@@ -3,7 +3,8 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::commands::{Command, Formatter};
+use crate::commands::Command;
+use crate::format::Formatter;
 use crate::look::Look;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -123,12 +124,14 @@ margin = 2
 # command.Word count = "wc -w < {file}"
 # command.Word count.output = "message"
 
-# Formatters: a program that reads the whole file on its standard input and
-# prints it back tidied. Ctrl+W runs the one for the file you are in, and
-# Ctrl+S runs it after saving (notes saving themselves as you type does not).
-# Ctrl+Shift+W (or Alt+W) lists them to pick one, for a note that has no file
-# yet. Ctrl+Z undoes it. Name them by the file's extension, or by a language
-# omanote knows: format.sh covers .bashrc and .zsh too.
+# Formatters: a program that reads text on its standard input and prints it
+# back tidied. Ctrl+W runs the one for the file you are in, and Ctrl+S runs
+# it after saving (notes saving themselves as you type does not). In a note,
+# each fenced block goes through the one for its language too: ```yaml
+# through format.yaml, the prose left alone. Ctrl+Shift+W (or Alt+W) lists
+# them to pick one, for a note that has no file yet. Ctrl+Z undoes it. Name
+# them by the file's extension, or by a language omanote knows: format.sh
+# covers .bashrc and .zsh too.
 #
 #   format.<kind> = "<what to run>"
 #   format.<kind>.save = false         Ctrl+W only, not after Ctrl+S
@@ -366,7 +369,7 @@ fn parse(text: &str) -> (Config, Vec<String>) {
                 }
             }
             formatter if formatter.starts_with("format.") => {
-                if let Err(problem) = crate::commands::set_formatter(&mut config.formatters, &formatter["format.".len()..], value) {
+                if let Err(problem) = crate::format::set_formatter(&mut config.formatters, &formatter["format.".len()..], value) {
                     problems.push(format!("line {}: {problem}", n + 1));
                 }
             }

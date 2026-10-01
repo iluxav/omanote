@@ -212,7 +212,7 @@ Anything that reads text and prints text fits: `llm`, `claude -p`, `codex exec`,
 
 ### Formatting
 
-A formatter is a program that reads the whole file on its standard input and prints it back tidied. Name one for each kind of file in the settings, by the file's extension or by a language omanote knows:
+A formatter is a program that reads text on its standard input and prints it back tidied. Name one for each kind of file in the settings, by the file's extension or by a language omanote knows:
 
 ```toml
 format.md = "prettier --parser markdown"
@@ -221,9 +221,12 @@ format.sh = "shfmt"          # any shell file: .bashrc and .zsh too
 format.py = "ruff format -"
 format.rs = "rustfmt"
 format.json = "jq ."
+format.yaml = "prettier --parser yaml"
 ```
 
-`Ctrl+W` runs the one for the file you are in, and `Ctrl+S` runs it after saving and writes the result; `Ctrl+Z` undoes it. `Ctrl+Shift+W` (or `Alt+W`, in a terminal that cannot tell `Ctrl+Shift+W` from `Ctrl+W`) lists the formatters to pick one: for a note that has no file yet, or text in a language its name does not say. Notes save themselves as you type, and that never formats: only `Ctrl+S` does, and `format.md.save = false` keeps a formatter to `Ctrl+W` alone. A formatter runs beside the editor like a command: the cursor stays where it was, one that fails or prints nothing changes nothing and says why, and if you typed while it ran the note is left alone. `{file}` is the note's path, for a formatter that picks its rules from the file name (`prettier --stdin-filepath {file}`).
+A file goes through the formatter for its kind whole. In a note, each fenced block goes through the formatter for the language its fence names, and the prose around it is left alone: a ```` ```yaml ```` or ```` ```yml ```` block through `format.yaml`, a ```` ```bash ```` one through `format.sh`, a ```` ```sql ```` one through `format.sql` if you name one. The formatter gets just the code, without the fences or the indent of a list item, and `{file}` is the note under the block's language (`trip.yaml`). If there is a `format.md` too, the note goes through it first and the blocks after, so each language's own formatter has the last word on its code. A block that fails is left as it was and named in the status line (`the yaml block at line 12: …`); the rest are still tidied.
+
+`Ctrl+W` runs the one for the file you are in (and the ones for a note's code blocks), and `Ctrl+S` runs it after saving and writes the result; `Ctrl+Z` undoes it. `Ctrl+Shift+W` (or `Alt+W`, in a terminal that cannot tell `Ctrl+Shift+W` from `Ctrl+W`) lists the formatters to pick one: for a note that has no file yet, or text in a language its name does not say. Notes save themselves as you type, and that never formats: only `Ctrl+S` does, and `format.md.save = false` keeps a formatter to `Ctrl+W` alone (`format.yaml.save = false`: a note's yaml blocks too). A formatter runs beside the editor like a command: the cursor stays with the line it was on, one that fails or prints nothing changes nothing and says why, and if you typed while it ran the note is left alone. `{file}` is the note's path, for a formatter that picks its rules from the file name (`prettier --stdin-filepath {file}`).
 
 ### Tables
 
@@ -369,6 +372,26 @@ Notes in a `--vlgh` vault are kept in step with the repo, in the background:
 To sync by hand, and see what happened, run `omanote --sync`: it goes through every GitHub vault, commits anything uncommitted, pulls, then pushes, and exits non-zero if a vault failed.
 
 If the same note was changed in two places, your version is committed locally, nothing is overwritten, and omanote tells you to resolve it with git. Offline, commits wait and go out the next time you open or save a note in that vault. Set `OMANOTE_SYNC=off` to turn all of this off. Folders added with `--vl` are never committed to, even if they are git repositories.
+
+### Pinning a project's docs
+
+One place to read the docs that agents keep up to date in each project. Inside a project:
+
+```sh
+omanote --pin README.md --as my-project   # asks which vault, then links it in as my-project.md
+omanote --pins                            # every pin, and which ones are broken
+omanote --unpin my-project                # remove the pin; the project's file stays
+```
+
+The pin is a link to the project's file, not a copy. `Ctrl+P` finds it, sorted by when the project's file last changed, and saving it from the vault changes the project. The vault's `index.md` gets a link to it.
+
+Without `--as`, the pin is named after the project's folder (or, for a file other than the README, the folder and the file: `my-project-agents`). A name can put the pin in a folder of the vault: `--as projects/my-project`. With a single vault there is no question; with several, the answer can also be piped in: `echo 2 | omanote --pin README.md`.
+
+The link only works on this machine, so it goes in the vault's `.gitignore` and a GitHub vault never pushes it. The `index.md` line and the `.gitignore` do sync.
+
+If the project moves or is deleted, the pin breaks: `--pins` flags it and `Ctrl+P` stops listing it. Pinning the file again from where it is now repairs it. A name that is already taken is refused, whether by a note or by a pin of another file.
+
+Pins only go one way. Linking vault notes into projects would break in clones, CI and containers, and have agents writing one project's details into a shared note; `@` imports in `CLAUDE.md` already cover that direction.
 
 ## Development
 
