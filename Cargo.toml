@@ -1,6 +1,6 @@
 [package]
 name = "omanote"
-version = "0.0.22"
+version = "0.0.23"
 edition = "2024"
 description = "An Obsidian-style markdown note editor for the terminal"
 license = "MIT"
