@@ -81,6 +81,8 @@ struct Parked {
 
 struct App {
     ed: Editor,
+    /// The desktop's primary selection, kept to `ed`'s selection.
+    primary: clipboard::Primary,
     other: Option<Parked>,
     /// With two notes open: the one being written in is the right-hand one.
     on_right: bool,
@@ -2395,6 +2397,7 @@ fn main() -> std::io::Result<()> {
     let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
     let mut app = App {
         ed: Editor::new("", None),
+        primary: clipboard::Primary::new(),
         other: None,
         on_right: false,
         other_area: None,
@@ -2573,9 +2576,12 @@ fn main() -> std::io::Result<()> {
                 terminal.draw(|f| ui::draw(f, &mut app.ed, scene))?;
             }
 
+            // What is selected, for the desktop; a change that has to wait
+            // (the selection is still growing) is looked at again soon.
+            let primary_waits = app.primary.update(app.ed.selected_text());
             // While a guess is due or on its way, look often enough that it shows without delay.
             let guess_due = app.completer.is_some() && (app.guessing || app.ed.last_change.elapsed() < GUESS_SETTLE * 2);
-            let wait = Duration::from_millis(if app.pane.is_some() || guess_due { 25 } else if app.running.is_some() { 80 } else { 250 });
+            let wait = Duration::from_millis(if app.pane.is_some() || guess_due || primary_waits { 25 } else if app.running.is_some() { 80 } else { 250 });
             let input = match watch_terminal(wait) {
                 Tty::Gone => {
                     STOP.store(true, Ordering::Relaxed);

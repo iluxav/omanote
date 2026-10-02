@@ -3,6 +3,7 @@
 
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 fn wayland() -> bool {
     std::env::var_os("WAYLAND_DISPLAY").is_some()
@@ -21,6 +22,67 @@ fn wl_copy(text: &str) -> Option<()> {
     let mut child = Command::new("wl-copy").stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().ok()?;
     child.stdin.take()?.write_all(text.as_bytes()).ok()?;
     child.wait().ok()?.success().then_some(())
+}
+
+/// How often a selection that keeps changing (Shift+Down held) is published.
+const PRIMARY_EVERY: Duration = Duration::from_millis(100);
+
+/// What hands a selection (or `None`, none) to the desktop.
+type SetPrimary = Box<dyn FnMut(Option<&str>)>;
+
+/// The desktop's primary selection, kept to what is selected in the note, as
+/// GUI apps do. Our selection is drawn by us, so the terminal never sees it:
+/// without this, a middle click or a tool that works on "the selected text"
+/// (omaestro's `om.selection()`) gets whatever was selected before, in
+/// another app. Wayland only (`wl-copy --primary`): OSC 52 would make some
+/// terminals ask for permission on every change.
+pub struct Primary {
+    /// What the desktop has from us: `None` for nothing (or cleared).
+    published: Option<String>,
+    at: Option<Instant>,
+    set: SetPrimary,
+}
+
+impl Primary {
+    pub fn new() -> Self {
+        if wayland() { Self::with(Box::new(set_primary)) } else { Self::with(Box::new(|_| {})) }
+    }
+
+    fn with(set: SetPrimary) -> Self {
+        Self { published: None, at: None, set }
+    }
+
+    /// Hands `selected` to the desktop when it changed: at once, unless the
+    /// last change went out less than PRIMARY_EVERY ago. Returns whether a
+    /// change is waiting, so the caller looks again soon.
+    pub fn update(&mut self, selected: Option<String>) -> bool {
+        if selected == self.published {
+            return false;
+        }
+        if self.at.is_some_and(|at| at.elapsed() < PRIMARY_EVERY) {
+            return true;
+        }
+        (self.set)(selected.as_deref());
+        self.published = selected;
+        self.at = Some(Instant::now());
+        false
+    }
+}
+
+/// The text as the primary selection, or (`None`) no primary selection. A
+/// failure leaves the old one; there is nobody to tell.
+fn set_primary(text: Option<&str>) {
+    let mut wl_copy = Command::new("wl-copy");
+    wl_copy.arg("--primary").stdout(Stdio::null()).stderr(Stdio::null());
+    let Some(text) = text else {
+        let _ = wl_copy.arg("--clear").status();
+        return;
+    };
+    let Ok(mut child) = wl_copy.stdin(Stdio::piped()).spawn() else { return };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(text.as_bytes());
+    }
+    let _ = child.wait();
 }
 
 /// System clipboard contents, if we can read them. Terminals that paste by
@@ -112,6 +174,36 @@ mod tests {
         assert_eq!(super::image_type("text/plain;charset=utf-8\ntext/plain\ntext/html\n"), None);
         assert_eq!(super::image_type("text/plain\nimage/png\n"), None);
         assert_eq!(super::image_type("application/pdf\n"), None);
+    }
+
+    #[test]
+    fn the_primary_selection_follows_the_note_without_flooding() {
+        use std::sync::{Arc, Mutex};
+        let sent: Arc<Mutex<Vec<Option<String>>>> = Arc::default();
+        let log = sent.clone();
+        let mut primary = super::Primary::with(Box::new(move |t| log.lock().unwrap().push(t.map(str::to_string))));
+        let sent = || sent.lock().unwrap().clone();
+
+        // Nothing selected from the start: nothing to say.
+        assert!(!primary.update(None));
+        assert!(sent().is_empty());
+        // A selection goes out at once, and only once.
+        assert!(!primary.update(Some("one".into())));
+        assert!(!primary.update(Some("one".into())));
+        assert_eq!(sent(), [Some("one".to_string())]);
+        // Changing faster than PRIMARY_EVERY waits, and says so...
+        assert!(primary.update(Some("one two".into())));
+        assert!(primary.update(Some("one two three".into())));
+        assert_eq!(sent().len(), 1);
+        // ...then the latest goes out.
+        std::thread::sleep(super::PRIMARY_EVERY);
+        assert!(!primary.update(Some("one two three".into())));
+        assert_eq!(sent().last(), Some(&Some("one two three".to_string())));
+        // Deselecting clears it.
+        std::thread::sleep(super::PRIMARY_EVERY);
+        assert!(!primary.update(None));
+        assert_eq!(sent().last(), Some(&None));
+        assert_eq!(sent().len(), 3);
     }
 
     #[test]
